@@ -1,0 +1,16 @@
+Bootstrap: docker
+From: nvcr.io/nvidia/tensorflow:20.11-tf2-py3
+
+%post
+    pip install qiskit qiskit-aer-gpu numba matplotlib
+    pip cache purge
+
+    wget https://nodejs.org/dist/v14.15.2/node-v14.15.2-linux-x64.tar.xz
+    tar xf node-v14.15.2-linux-x64.tar.xz
+    cp -r node-v14.15.2-linux-x64/{bin,include,lib,share} /usr/local
+    rm -rf node-v14*
+
+    jupyter labextension install jupyterlab-emacskeys
+
+%startscript
+    jupyter lab --no-browser

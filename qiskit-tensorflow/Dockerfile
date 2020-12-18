@@ -8,3 +8,5 @@ EXPOSE 8888
 RUN useradd -ms /bin/bash quantum
 USER quantum
 WORKDIR /home/quantum
+
+#RUN git clone https://github.com/yiiyama/qc_random
