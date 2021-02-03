@@ -2,7 +2,7 @@ Bootstrap: docker
 From: nvcr.io/nvidia/tensorflow:20.12-tf2-py3
 
 %post
-    pip install qiskit qiskit-aer-gpu numba matplotlib pylatexenc
+    pip install qiskit qiskit-aer-gpu numba matplotlib pylatexenc pennylane pennylane-qiskit
     pip cache purge
 
     wget https://nodejs.org/dist/v14.15.2/node-v14.15.2-linux-x64.tar.xz
