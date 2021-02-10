@@ -26,17 +26,17 @@ def binary_mlp(layer_nodes, input_x, input_y, x_precision=1, gatify=-1):
     assert(input_x.shape[0] == input_y.shape[0] and input_x.shape[1] == layer_nodes[0])
     assert(x_precision > 0)
     
-    reg_input_index, reg_data_input_y, reg_data, reg_weights, reg_amp = register_lists = setup_registers(layer_nodes, input_x, input_y, x_precision)
+    reg_input_index, reg_data_input_y, reg_data, reg_weights, reg_biases, reg_amp = register_lists = setup_registers(layer_nodes, input_x, input_y, x_precision)
 
     registers = flatten_list(*register_lists)
     circuit = QuantumCircuit(*registers)
 
-    circuit += initialize_weights(reg_weights, gatify=gatify)
+    circuit += initialize_weights(reg_weights, reg_biases, gatify=gatify)
     circuit += load_data(reg_input_index, reg_data[0], reg_data_input_y[0], input_x, input_y, x_precision, gatify=gatify)
     if gatify >= 0:
         circuit.barrier()
         
-    circuit += feedforward(reg_data, reg_weights, gatify=gatify)
+    circuit += feedforward(reg_data, reg_weights, reg_biases, gatify=gatify)
     if gatify >= 0:
         circuit.barrier()
 
@@ -44,8 +44,6 @@ def binary_mlp(layer_nodes, input_x, input_y, x_precision=1, gatify=-1):
     if gatify >= 0:
         circuit.barrier()
         
-    circuit += aggregate_amplitudes(reg_input_index, gatify=gatify)
-    
     return circuit
 
 
@@ -81,27 +79,34 @@ def setup_registers(layer_nodes, input_x, input_y, x_precision):
     num_layers = len(layer_nodes)
     full_layer_nodes = list(layer_nodes)
     full_layer_nodes.append(1)
-
+    
     reg_input_index = QuantumRegister(input_index_size, 'index')
     reg_data_input_x = list(QuantumRegister(x_precision, 'x^{{{}}}'.format(i)) for i in range(layer_nodes[0]))
     reg_data_input_y = QuantumRegister(1, 'y')
 
     reg_data = [reg_data_input_x]
     reg_weights = []
-    data_max = 2 ** x_precision
+    reg_biases = []
+    data_width = x_precision + 1
+    data_max = 2 ** (x_precision - 1)
     for ilayer in range(num_layers):
+        # fixing the bias width to the data width of the previous layer - can be reconsidered
+        reg_biases.append(list(QuantumRegister(data_width, 'b^{{l{}n{}}}'.format(ilayer + 1, n)) for n in range(full_layer_nodes[ilayer + 1])))
+        
         # could also think about truncating the layer inputs if compounding data size becomes an issue
-        data_max *= layer_nodes[ilayer]
-        data_width = np.ceil(np.log2(data_max)) + 1 # 1 for sign
+        data_max *= (layer_nodes[ilayer] + 1) # +1 for the bias
+        data_width = int(np.ceil(np.log2(data_max + 0.5))) + 1 # 1 for sign
+
         reg_data.append(list(QuantumRegister(data_width, 'd^{{l{}n{}}}'.format(ilayer + 1, n)) for n in range(full_layer_nodes[ilayer + 1])))
+
         weights = []
         for inode_next in range(full_layer_nodes[ilayer + 1]):
-            weights.append(list(QuantumRegister(1, 'w^{{l{}n{}ton{}}}'.format(ilayer, n, inode_next)) for n in range(full_layer_nodes[ilayer])))
+            weights.append(list(QuantumRegister(1, 'w^{{l{}n{}fromn{}}}'.format(ilayer + 1, inode_next, n)) for n in range(full_layer_nodes[ilayer])))
         reg_weights.append(weights)
 
     reg_amp = QuantumRegister(1, 'amp')
     
-    return reg_input_index, reg_data_input_y, reg_data, reg_weights, reg_amp
+    return reg_input_index, reg_data_input_y, reg_data, reg_weights, reg_biases, reg_amp
 
 
 def flatten_list(*reg_lists):
@@ -118,17 +123,18 @@ def flatten_list(*reg_lists):
     return registers
 
 
-def initialize_weights(reg_weights, gatify=-1):
+def initialize_weights(reg_weights, reg_biases, gatify=-1):
     """Initialize the weight registers into a full superposition state.
     
     Args:
         reg_weights (list[list[list[QuantumRegister]]]): weight registers
+        reg_biases (list[list[QuantumRegister]]): bias registers
         
     Returns:
         QuantumCircuit: Circuit corresponding to this subroutine.
     """
     
-    registers = flatten_list(reg_weights)
+    registers = flatten_list(reg_weights, reg_biases)
     circuit = QuantumCircuit(*registers)
     
     # Make weights a full superposition
@@ -279,17 +285,15 @@ def load_data(reg_input_index, reg_data_input_x, data_input_y, input_x, input_y,
         return circuit
 
 
-def accumulate_phase_single(data, idigit, weight, targ, activation, gatify=-1):
+def add_weighted_input_single(source_bit, weight, targ, sign_bit, gatify=-1):
     """Multiply one bit from the output of a node in the previous layer with the weight and
     pass the result to the target node.
     
     Args:
-        data (QuantumRegister): Input data for one node in the previous layer.
-        idigit (int): Digit number of the input.
+        source_bit (Qubit): Source bit.
         weight (Qubit): Binary weight connecting the input and target nodes.
-        targ (QuantumRegister): Input data for the target node.
-        activation (bool): If True, last bit of data is considered as the sign bit
-            and data is propagated only if this bit is 0.
+        targ (QuantumRegister): Input source for the target node.
+        sign_bit (Qubit or None): If a qubit, control the entire operation on this bit
             
     Returns:
         QuantumCircuit: Circuit corresponding to this subroutine.
@@ -298,65 +302,133 @@ def accumulate_phase_single(data, idigit, weight, targ, activation, gatify=-1):
     ancilla = reg_ancilla[0]
     reg_ancilla_activation = AncillaRegister(1, 'activation')
     ancilla_activation = reg_ancilla_activation[0]
-    circuit = QuantumCircuit(data, weight.register, targ, reg_ancilla, reg_ancilla_activation)
+    circuit = QuantumCircuit(source_bit.register, weight.register, targ, reg_ancilla, reg_ancilla_activation)
     
-    data_bit = data[idigit]
-    
-    if activation:
-        sign_bit = data[-1]
-        # because of x(data[-1]) in the parent function, sign_bit is 1 if sign of data is positive
-        circuit.mcx([data_bit, sign_bit], ancilla_activation)
-        data_ctrl = ancilla_activation
+    if sign_bit is not None:
+        # because of x(sign_bit) in the parent function, sign_bit is 1 if sign of the source is positive
+        circuit.mcx([source_bit, sign_bit], ancilla_activation)
+        source_ctrl = ancilla_activation
     else:
-        data_ctrl = data_bit
+        source_ctrl = source_bit
 
     dphi = 2. * np.pi / (2 ** targ.size)
         
     for itarg in range(targ.size):
-        circuit.mcx([data_ctrl, targ[itarg]], ancilla)
-        circuit.crz(2. * dphi * (2 ** (idigit + itarg)), ancilla, weight) # phase + w*(x[d]&t)*dphi*2^(d+t) [note rz(2*theta) = exp(-theta Z)]
-        circuit.mcx([data_ctrl, targ[itarg]], ancilla)
+        circuit.mcx([source_ctrl, targ[itarg]], ancilla)
+        circuit.crz(2. * dphi * (2 ** (source_bit.index + itarg)), ancilla, weight) # note rz(2*theta) = exp(-theta Z)
+        circuit.mcx([source_ctrl, targ[itarg]], ancilla)
 
-    if activation:
-        circuit.mcx([data_bit, sign_bit], ancilla_activation)
+    if sign_bit is not None:
+        circuit.mcx([source_bit, sign_bit], ancilla_activation)
         
     if gatify < 0 or gatify >= 1:
-        return to_gate(circuit, 'accumulate_phase_single')
+        return to_gate(circuit, 'add_weighted_input_single')
     else:
         return circuit
 
     
-def accumulate_phase(data, weight, targ, activation, gatify=-1):
+def add_weighted_input(source, weight, targ, activation, gatify=-1):
     """Multiply the output of a node in the previous layer with the weight and
     pass the result to the target node.
     
     Args:
-        data (QuantumRegister): Input data for one node in the previous layer.
+        source (QuantumRegister): Value of the source node.
         weight (Qubit): Binary weight connecting the input and target nodes.
-        targ (QuantumRegister): Input data for the target node.
-        activation (bool): If True, last bit of data is considered as the sign bit
-            and data is propagated only if this bit is 0.
+        targ (QuantumRegister): Value of the target node.
+        activation (bool): If True, last bit of source is considered as the sign bit
+            and source is propagated only if this bit is 0.
             
     Returns:
         QuantumCircuit: Circuit corresponding to this subroutine.
     """
 
-    circuit = QuantumCircuit(data, weight.register, targ)
+    circuit = QuantumCircuit(source, weight.register, targ)
     
     if activation:
-        max_digits = data.size - 1        
-        circuit.x(data[-1]) # relu activation -> only apply rz when the sign bit is 0
+        max_digits = source.size - 1
+        sign_bit = source[-1]
+        circuit.x(sign_bit) # relu activation -> only apply rz when the sign bit is 0
     else:
-        max_digits = data.size
+        max_digits = source.size
+        sign_bit = None
         
     for idigit in range(max_digits):
-        circuit += accumulate_phase_single(data, idigit, weight, targ, activation, gatify=gatify)
+        circuit += add_weighted_input_single(source[idigit], weight, targ, sign_bit, gatify=gatify)
         
     if activation:
-        circuit.x(data[-1]) # relu activation -> only apply rz when the sign bit is 0
+        circuit.x(sign_bit) # relu activation -> only apply rz when the sign bit is 0
         
     if gatify < 0 or gatify >= 2:
-        return to_gate(circuit, 'accumulate_phase')
+        return to_gate(circuit, 'add_weighted_input')
+    else:
+        return circuit
+
+    
+def add_bias(bias, targ, gatify=-1):
+    """Apply the bias to the target node.
+    
+    Args:
+        bias (QuantumRegister): Bias on the target node.
+        targ (QuantumRegister): Value of the target node.
+
+    Returns:
+        QuantumCircuit: Circuit corresponding to this subroutine.    
+    """
+
+    reg_ancilla = AncillaRegister(1, 'ancilla')
+    ancilla = reg_ancilla[0]
+    circuit = QuantumCircuit(bias, targ, reg_ancilla)
+    
+    sign_bit = bias[-1]
+    
+    dphi = 2. * np.pi / (2 ** targ.size)
+
+    # Because the width of the bias and target registers differ in general,
+    # we need to flip the bias data bits and apply an extra -dphi
+    # when the sign is negative.
+    for bias_bit in bias[:-1]:
+        circuit.cx(sign_bit, bias_bit)
+
+        for targ_bit in targ:
+            circuit.cp(-dphi * (2 ** targ_bit.index), targ_bit, sign_bit)
+            circuit.mcx([bias_bit, targ_bit], ancilla)
+            circuit.crz(-2. * dphi * (2 ** (bias_bit.index + targ_bit.index)), ancilla, sign_bit)
+            circuit.mcx([bias_bit, targ_bit], ancilla)
+
+        circuit.cx(sign_bit, bias_bit)
+
+    if gatify < 0 or gatify >= 1:
+        return to_gate(circuit, 'add_bias')
+    else:
+        return circuit
+
+    
+def set_target_phase(layer_input, weights, bias, targ, activation, gatify=-1):
+    """Apply phases to the bases of the target register to make sum_{k} e^{2*pi*i*output*k}|k>
+    
+    Args:
+        layer_input (list[QuantumRegister]): Values of the nodes in the previous layer.
+        weights (list[QuantumRegister]): Binary weights connecting the input nodes to the target.
+        bias (QuantumRegister): Bias on the target node.
+        targ (QuantumRegister): Value of the target node.
+        activation (bool): Whether to activate layer_input with ReLU.
+        
+    Returns:
+        QuantumCircuit: Circuit corresponding to this subroutine.
+    """
+    
+    registers = flatten_list(layer_input, weights, bias, targ)
+    circuit = QuantumCircuit(*registers)
+    
+    # Loop over nodes in the previous layer
+    for source, weight in zip(layer_input, weights):
+        # weight qubit: 0 -> w=-1, 1 -> w=+1
+        circuit += add_weighted_input(source, weight[0], targ, activation, gatify=gatify)
+        
+    circuit += add_bias(bias, targ, gatify=gatify)
+    
+    if gatify < 0 or gatify >= 3:
+        return to_gate(circuit, 'set_target_phase')
     else:
         return circuit
 
@@ -374,84 +446,86 @@ def inverse_qft(targ, gatify=-1):
     else:
         return circuit
 
-    
-def propagate_one(layer_input, weights, targ, activation, gatify=-1):
+
+def propagate_one(layer_input, weights, bias, targ, activation, gatify=-1):
     """Propagate the output of all nodes in the previous layer through weights
     to the target node.
     
     Args:
-        layer_input (list[QuantumRegister]): Input data for nodes in the previous layer.
+        layer_input (list[QuantumRegister]): Values of the nodes in the previous layer.
         weights (list[QuantumRegister]): Binary weights connecting the input nodes to the target.
-        targ (QuantumRegister): Input data for the target node.
+        bias (QuantumRegister): Bias on the target node.
+        targ (QuantumRegister): Value of the target node.
         activation (bool): Whether to activate layer_input with ReLU.
         
     Returns:
         QuantumCircuit: Circuit corresponding to this subroutine.
     """
 
-    registers = flatten_list(layer_input, weights, targ)
+    registers = flatten_list(layer_input, weights, bias, targ)
     circuit = QuantumCircuit(*registers)
     
     # Prepare the next input register for phase estimation
     circuit.h(targ)
-
-    for data, weight in zip(layer_input, weights):
-        # weight qubit: 0 -> w=-1, 1 -> w=+1
-        circuit += accumulate_phase(data, weight[0], targ, activation, gatify=gatify)
+    
+    circuit += set_target_phase(layer_input, weights, bias, targ, activation, gatify=gatify)
 
     circuit += inverse_qft(targ)
 
-    if gatify < 0 or gatify >= 3:
+    if gatify < 0 or gatify >= 4:
         return to_gate(circuit, 'propagate_one')
     else:
         return circuit
 
     
-def propagate(layer_input, layer_weights, layer_output, activation, gatify=-1):
+def propagate(layer_input, layer_weights, layer_biases, layer_output, activation, gatify=-1):
     """Propagate the output of all nodes in the previous layer through weights.
     
     Args:
-        layer_input (list[QuantumRegister]): Input data for nodes in the previous layer.
+        layer_input (list[QuantumRegister]): Values of the nodes in the previous layer.
         layer_weights (list[list[QuantumRegister]]): Binary weights connecting the input nodes to the target.
-        layer_output (list[QuantumRegister]): Input data for the target nodes.
+        layer_biases (list[QuantumRegister]): Biases on the next layer.
+        layer_output (list[QuantumRegister]): Values of the nodes in the next layer.
         activation (bool): Whether to activate layer_input with ReLU.
         
     Returns:
         QuantumCircuit: Circuit corresponding to this subroutine.
     """
     
-    registers = flatten_list(layer_input, layer_weights, layer_output)
+    registers = flatten_list(layer_input, layer_weights, layer_biases, layer_output)
     circuit = QuantumCircuit(*registers)
     
-    for weights, targ in zip(layer_weights, layer_output):
-        circuit += propagate_one(layer_input, weights, targ, activation, gatify=gatify)
+    for weights, bias, targ in zip(layer_weights, layer_biases, layer_output):
+        circuit += propagate_one(layer_input, weights, bias, targ, activation, gatify=gatify)
 
-    if gatify < 0 or gatify >= 4:
+    if gatify < 0 or gatify >= 5:
         return to_gate(circuit, 'propagate')
     else:
         return circuit
 
     
-def feedforward(reg_data, reg_weights, gatify=-1):
+def feedforward(reg_data, reg_weights, reg_biases, gatify=-1):
     """Apply weights to the input data and compute the output of the network.
     
     Args:
         reg_data (list[list[QuantumRegister]]): Data registers.
         reg_weights (list[list[list[QuantumRegister]]]): Weight registers.
+        reg_biases (list[list[QuantumRegister]]): Bias registers.
 
     Returns:
         QuantumCircuit: Circuit corresponding to this subroutine.
     """
     
-    registers = flatten_list(reg_data, reg_weights)
+    registers = flatten_list(reg_data, reg_weights, reg_biases)
     circuit = QuantumCircuit(*registers)
     
     for ilayer in range(len(reg_data) - 1):
         layer_input = reg_data[ilayer]
         layer_output = reg_data[ilayer + 1]
         layer_weights = reg_weights[ilayer]
+        layer_biases = reg_biases[ilayer]
         
-        circuit += propagate(layer_input, layer_weights, layer_output, ilayer > 0, gatify=gatify)
+        circuit += propagate(layer_input, layer_weights, layer_biases, layer_output, ilayer > 0, gatify=gatify)
         if gatify >= 0:
             circuit.barrier()
             
@@ -462,8 +536,8 @@ def feedforward(reg_data, reg_weights, gatify=-1):
 
 
 def transduce_amplitude(y, out_node_data, amp, gatify=-1):
-    """Transduce the amplitude [cos(pi/4 - out)] for each sample from the output node data.
-    Normalizes out so that we work in the upper quadrant.
+    """Transduce the amplitude `[cos(pi/4 - out)]` for each sample from the output node data.
+    Normalizes `out` so that we work in the upper quadrant.
     
     Args:
         y (Qubit): Input y.
@@ -516,26 +590,5 @@ def transduce_amplitude(y, out_node_data, amp, gatify=-1):
 
     if gatify != 0:
         return to_gate(circuit, 'transduce_amplitude')
-    else:
-        return circuit
-
-
-def aggregate_amplitudes(reg_input_index, gatify=-1):
-    """Set the amplitude of |0> to [sum_{sample} cos(pi/4 - out_{sample})].
-    
-    Args:
-        reg_input_index: Index register.
-        
-    Returns:
-        QuantumCircuit: Circuit corresponding to this subroutine.
-    """
-    
-    circuit = QuantumCircuit(reg_input_index)
-        
-    # Basis change - amplitude of |0> will be [sum_{sample} cos(pi/4 - out_{sample})]
-    circuit.h(reg_input_index)
-
-    if gatify != 0:
-        return to_gate(circuit, 'aggregate_amplitudes')
     else:
         return circuit
