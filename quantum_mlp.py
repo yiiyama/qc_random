@@ -2,6 +2,9 @@ from qiskit import QuantumCircuit, QuantumRegister, AncillaRegister, ClassicalRe
 from qiskit.circuit.library.basis_change.qft import QFT
 import numpy as np
 
+ # Flag to not leave e.g. ancillas in used state
+CLEAN_UP_AFTER_ONESELF = True
+
 ##########################
 ### The main function ###
 ##########################
@@ -26,11 +29,9 @@ def binary_mlp(layer_nodes, input_x, input_y, x_precision=1, gatify=-1):
     reg_input_index, reg_data_input_y, reg_data, reg_weights, reg_amp = register_lists = setup_registers(layer_nodes, input_x, input_y, x_precision)
 
     registers = flatten_list(*register_lists)
-    print(registers)
     circuit = QuantumCircuit(*registers)
 
     circuit += initialize_weights(reg_weights, gatify=gatify)
-
     circuit += load_data(reg_input_index, reg_data[0], reg_data_input_y[0], input_x, input_y, x_precision, gatify=gatify)
     if gatify >= 0:
         circuit.barrier()
@@ -39,7 +40,7 @@ def binary_mlp(layer_nodes, input_x, input_y, x_precision=1, gatify=-1):
     if gatify >= 0:
         circuit.barrier()
 
-    circuit += transduce_amplitude(reg_data_input_y[0], reg_data[num_layers][0], reg_amp[0], gatify=gatify)
+    circuit += transduce_amplitude(reg_data_input_y[0], reg_data[-1][0], reg_amp[0], gatify=gatify)
     if gatify >= 0:
         circuit.barrier()
         
@@ -461,7 +462,7 @@ def feedforward(reg_data, reg_weights, gatify=-1):
 
 
 def transduce_amplitude(y, out_node_data, amp, gatify=-1):
-    """Transduce the amplitude [cos(pi/2 - out)] for each sample from the output node data.
+    """Transduce the amplitude [cos(pi/4 - out)] for each sample from the output node data.
     Normalizes out so that we work in the upper quadrant.
     
     Args:
@@ -475,20 +476,28 @@ def transduce_amplitude(y, out_node_data, amp, gatify=-1):
 
     circuit = QuantumCircuit(y.register, out_node_data, amp.register)
 
-    # Will use H-Rz-H instead of repeated Rys
-    circuit.h(amp)
-    circuit.rz(-np.pi, amp)
-
     # Flip the ancilla according to the parity between the sign of the output node data and input y
     # (o<0 && y==1) or (o>=0 && y==0) -> reduce amplitude
     sign_bit = out_node_data[-1]
-    circuit.cx(y, sign_bit)
+    circuit.cx(sign_bit, y)
 
-    # sign_bit==1 implies parity==-1. Flip the phase of the amp qubit using the identity
+    # We are going to move the angles between 0 and pi/2, not 0 and 2pi. Need to flip the data bits
+    # if sign_bit is 1
+    circuit.cx(sign_bit, out_node_data[:-1])
+
+    # Will use H-Rz-H instead of repeated Rys
+    circuit.h(amp)
+    circuit.rz(-np.pi / 2., amp)
+
+    # Now y==1 implies parity==1. Flip the phase of the amp qubit using the identity
     # X-Rz(phi)-X = Rz(-phi)
-    circuit.cx(sign_bit, amp)
-    
-    dtheta = np.pi / 2. / (2 ** (out_node_data.size - 1))
+    circuit.cx(y, amp)
+
+    dtheta = np.pi / 4. / (2 ** (out_node_data.size - 1))
+
+    # Give a dtheta kick if sign_bit is 1 because data[:-1] == 0 means -1 in that case
+    circuit.crz(-2. * dtheta, sign_bit, amp)
+
     for idigit in range(out_node_data.size - 1):
         # We want to increase the amplitude when the parity is -1
         # -> reduce the phase when the parity is -1
@@ -496,11 +505,14 @@ def transduce_amplitude(y, out_node_data, amp, gatify=-1):
         # -> increase the phase
         # -> perform Rz(-theta) = exp(+i theta/2 Z)
         circuit.crz(-2. * dtheta * (2 ** idigit), out_node_data[idigit], amp)
-        
-    circuit.cx(sign_bit, amp)
-    circuit.cx(y, sign_bit)
+
+    circuit.cx(y, amp)
 
     circuit.h(amp)
+
+    if CLEAN_UP_AFTER_ONESELF:
+        circuit.cx(sign_bit, out_node_data[:-1])
+        circuit.cx(sign_bit, y)
 
     if gatify != 0:
         return to_gate(circuit, 'transduce_amplitude')
@@ -509,7 +521,7 @@ def transduce_amplitude(y, out_node_data, amp, gatify=-1):
 
 
 def aggregate_amplitudes(reg_input_index, gatify=-1):
-    """Set the amplitude of |0> to [sum_{sample} cos(pi/2 - out_{sample})].
+    """Set the amplitude of |0> to [sum_{sample} cos(pi/4 - out_{sample})].
     
     Args:
         reg_input_index: Index register.
@@ -520,7 +532,7 @@ def aggregate_amplitudes(reg_input_index, gatify=-1):
     
     circuit = QuantumCircuit(reg_input_index)
         
-    # Basis change - amplitude of |0> will be [sum_{sample} sin(pi/4 + out_sample)]
+    # Basis change - amplitude of |0> will be [sum_{sample} cos(pi/4 - out_{sample})]
     circuit.h(reg_input_index)
 
     if gatify != 0:
