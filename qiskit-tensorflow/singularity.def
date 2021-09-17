@@ -1,0 +1,29 @@
+Bootstrap: docker
+From: nvcr.io/nvidia/tensorflow:20.12-tf2-py3
+
+%post
+    pip install qiskit qiskit-aer-gpu numba matplotlib pylatexenc pennylane pennylane-qiskit
+    pip cache purge
+
+    wget https://nodejs.org/dist/v14.15.2/node-v14.15.2-linux-x64.tar.xz
+    tar xf node-v14.15.2-linux-x64.tar.xz
+    cp -r node-v14.15.2-linux-x64/{bin,include,lib,share} /usr/local
+    rm -rf node-v14*
+
+    git clone -b v0.7.0-custom https://github.com/yiiyama/jupyterlab-emacskeys
+    cd jupyterlab-emacskeys
+    npm install
+    npm run build
+    jupyter labextension link .
+
+%startscript
+    jupyter lab --no-browser
+
+%runscript
+    jupyter lab --no-browser
+
+%environment
+	export CUDA_CACHE_DISABLE=0
+	export LC_ALL=C
+	export PS1='[\u@\h \w]$'
+	
