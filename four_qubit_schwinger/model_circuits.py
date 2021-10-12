@@ -1,10 +1,7 @@
 import numpy as np
 import collections
-from qiskit import QuantumCircuit, pulse, transpile
+from qiskit import QuantumCircuit, pulse
 from qiskit import schedule as build_schedule
-from qiskit.circuit import Gate, Parameter
-
-from calibrations import LinearizedCR, cx_circuit
 
 nsites = 4
 
