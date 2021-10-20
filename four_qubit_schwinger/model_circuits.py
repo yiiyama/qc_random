@@ -1,188 +1,195 @@
-import numpy as np
-import collections
-from qiskit import QuantumCircuit, pulse
-from qiskit import schedule as build_schedule
+from qiskit import QuantumCircuit
 
-nsites = 4
-
-def single_step_no_opt(J, mu, omegadt):
+def single_step_no_opt(num_site, J, mu, omegadt):
     """Naive single-step circuit for reference.
     """
     
-    circuit = QuantumCircuit(nsites)
+    circuit = QuantumCircuit(num_site)
     
-    for j in range(nsites - 1):
+    for j in range(0, num_site - 1, 2):
         circuit.rxx(omegadt, j, j + 1)
         circuit.ryy(omegadt, j, j + 1)
 
+    for j in range(1, num_site - 1, 2):
+        circuit.rxx(omegadt, j, j + 1)
+        circuit.ryy(omegadt, j, j + 1)
+
+    for j in range(num_site - 1):
         for k in range(j):
-            circuit.rzz(J * (nsites - j - 1) * omegadt, k, j)
-            
-    for j in range(nsites):
-        angle = (mu * (-1. if j % 2 == 0 else 1.) - J * ((nsites - j) // 2)) * omegadt
+            circuit.rzz(J * (num_site - j - 1) * omegadt, k, j)    
+
+    for j in range(num_site):
+        angle = (mu * (-1. if j % 2 == 0 else 1.) - J * ((num_site - j) // 2)) * omegadt
         circuit.rz(angle, j)
         
     return circuit
 
-def _single_step_no_last_rzz_swap(J, mu, omegadt, crs=None, cxs=None):
-    circuit = QuantumCircuit(nsites)
+def _rxxryy(num_site, circuit, omegadt, qubits, rtts=None):
+    if rtts is None:
+        #circuit.rxx(omegadt, *qubits)
+        #circuit.ryy(omegadt, *qubits)
+        circuit.h(qubits)
+        circuit.s(qubits)
+        circuit.cx(*qubits)
+        circuit.rx(omegadt, qubits[0])
+        circuit.rz(omegadt, qubits[1])
+        circuit.cx(*qubits)
+        circuit.sdg(qubits)
+        circuit.h(qubits)
+    else:
+        circuit.compose(rtts[qubits].rxxryy_circuit(omegadt), qubits=qubits, inplace=True)
+
+def _single_step_no_last_rzz_and_swap(num_site, J, mu, omegadt, rtts=None, cxs=None):
+    circuit = QuantumCircuit(num_site)
     
-    # First step
-    
-    for j in range(nsites):
-        angle = (mu * (-1. if j % 2 == 0 else 1.) - J * ((nsites - j) // 2)) * omegadt
+    for j in range(num_site):
+        angle = (mu * (-1. if j % 2 == 0 else 1.) - J * ((num_site - j) // 2)) * omegadt
         circuit.rz(angle, j)
 
-    if crs is None:
-        circuit.rxx(omegadt, 0, 1)
-        circuit.ryy(omegadt, 0, 1)
-        circuit.rxx(omegadt, 2, 3)
-        circuit.ryy(omegadt, 2, 3)
-        circuit.rxx(omegadt, 1, 2)
-        circuit.ryy(omegadt, 1, 2)
-        circuit.rzz(omegadt, 1, 2)
-    else:
-        circuit.compose(crs[(0, 1)].rxx_circuit(omegadt), qubits=(0, 1), inplace=True)
-        circuit.compose(crs[(0, 1)].ryy_circuit(omegadt), qubits=(0, 1), inplace=True)
-        circuit.compose(crs[(2, 3)].rxx_circuit(omegadt), qubits=(2, 3), inplace=True)
-        circuit.compose(crs[(2, 3)].ryy_circuit(omegadt), qubits=(2, 3), inplace=True)
-        circuit.compose(crs[(1, 2)].rxx_circuit(omegadt), qubits=(1, 2), inplace=True)
-        circuit.compose(crs[(1, 2)].ryy_circuit(omegadt), qubits=(1, 2), inplace=True)
-        circuit.compose(crs[(1, 2)].rzz_circuit(omegadt), qubits=(1, 2), inplace=True)
-    
-    ## rzz(2 * omegadt, 0, 1)
-    if cxs is None:
-        circuit.cx(0, 1)
-    else:
-        circuit.compose(cxs[(0, 1)], qubits=(0, 1), inplace=True)
-    circuit.rz(2 * omegadt, 1)
-    #circuit.cx(0, 1)
+    for j in range(0, num_site - 1, 2):
+        _rxxryy(num_site, circuit, omegadt, (j, j + 1), rtts=rtts)
 
-    ## rzz(omegadt, 0, 2)
-    #circuit.cx(0, 1)
-    if cxs is None:
-        circuit.cx(1, 0)
-        circuit.cx(0, 1)
-    else:
-        circuit.compose(cxs[(1, 0)], qubits=(1, 0), inplace=True)
-        circuit.compose(cxs[(0, 1)], qubits=(0, 1), inplace=True)
-        
-    return circuit
+    for j in range(1, num_site - 1, 2):
+        _rxxryy(num_site, circuit, omegadt, (j, j + 1), rtts=rtts)
 
-def single_step(J, mu, omegadt, crs=None, cxs=None):
-    circuit = _single_step_no_last_rzz_swap(J, mu, omegadt, crs=crs, cxs=cxs)
-    if crs is None:
-        circuit.rzz(omegadt, 1, 2)
-    else:
-        circuit.compose(crs[(1, 2)].rzz_circuit(omegadt), qubits=(1, 2), inplace=True)
-        
-    if cxs is None:
-        circuit.cx(0, 1)
-        circuit.cx(1, 0)
-        circuit.cx(0, 1)
-    else:
-        circuit.compose(cxs[(0, 1)], qubits=(0, 1), inplace=True)
-        circuit.compose(cxs[(1, 0)], qubits=(1, 0), inplace=True)
-        circuit.compose(cxs[(0, 1)], qubits=(0, 1), inplace=True)
-    
-    return circuit
+    if num_site == 4:
+        k = 1
+        j = 2
+        angle = J * (num_site - j - 1) * omegadt
+        if rtts is None:
+            circuit.rzz(angle, k, j)
+        else:
+            circuit.compose(rtts[(k, j)].rzz_circuit(angle), qubits=(1, 2), inplace=True)
 
-def two_steps(J, mu, omegadt, crs=None, cxs=None):
-    # First step
-    
-    circuit = _single_step_no_last_rzz_swap(J, mu, omegadt, crs=crs, cxs=cxs)
-    #circuit.rzz(omegadt, 1, 2)
-    #circuit.cx(0, 1)
-    #circuit.cx(1, 0)
-    #circuit.cx(0, 1)
-
-    if crs is None:
-        circuit.rzz(2 * omegadt, 1, 2)
-    else:
-        circuit.compose(crs[(1, 2)].rzz_circuit(2 * omegadt), qubits=(1, 2), inplace=True)
-    
-    # Second step
-
-    # rzz(omegadt, 0, 2)
-    #circuit.cx(0, 1)
-    #circuit.cx(1, 0)
-    #circuit.cx(0, 1)
-    #circuit.rzz(omegadt, 1, 2)
-    if cxs is None:
-        circuit.cx(0, 1)
-        circuit.cx(1, 0)
-    else:
-        circuit.compose(cxs[(0, 1)], qubits=(0, 1), inplace=True)
-        circuit.compose(cxs[(1, 0)], qubits=(1, 0), inplace=True)
-    #circuit.cx(0, 1)
-    
-    # rzz(2 * omegadt, 0, 1)
-    #circuit.cx(0, 1)
-    circuit.rz(2 * omegadt, 1)
-    if cxs is None:
-        circuit.cx(0, 1)
-    else:
-        circuit.compose(cxs[(0, 1)], qubits=(0, 1), inplace=True)
-
-    if crs is None:
-        circuit.rxx(omegadt, 1, 2)
-        circuit.ryy(omegadt, 1, 2)
-        circuit.rzz(omegadt, 1, 2)
-        circuit.rxx(omegadt, 0, 1)
-        circuit.ryy(omegadt, 0, 1)
-        circuit.rxx(omegadt, 2, 3)
-        circuit.ryy(omegadt, 2, 3)
-    else:
-        circuit.compose(crs[(1, 2)].rxx_circuit(omegadt), qubits=(1, 2), inplace=True)
-        circuit.compose(crs[(1, 2)].ryy_circuit(omegadt), qubits=(1, 2), inplace=True)
-        circuit.compose(crs[(1, 2)].rzz_circuit(omegadt), qubits=(1, 2), inplace=True)
-        circuit.compose(crs[(0, 1)].rxx_circuit(omegadt), qubits=(0, 1), inplace=True)
-        circuit.compose(crs[(0, 1)].ryy_circuit(omegadt), qubits=(0, 1), inplace=True)
-        circuit.compose(crs[(2, 3)].rxx_circuit(omegadt), qubits=(2, 3), inplace=True)
-        circuit.compose(crs[(2, 3)].ryy_circuit(omegadt), qubits=(2, 3), inplace=True)
-       
-    for j in range(nsites):
-        angle = (mu * (-1. if j % 2 == 0 else 1.) - J * ((nsites - j) // 2)) * omegadt
+        k = 0
+        j = 1
+        angle = J * (num_site - j - 1) * omegadt
+        ## rzz(angle, k, j)
+        if cxs is None:
+            circuit.cx(k, j)
+        else:
+            circuit.compose(cxs[(k, j)], qubits=(k, j), inplace=True)
         circuit.rz(angle, j)
+        circuit.cx(k, j) # cancels with swap below
+
+        k = 0
+        ## swap(k, k + 1)
+        circuit.cx(k, k + 1) # cancels with rzz above
+        if cxs is None:
+            circuit.cx(k + 1, k)
+            circuit.cx(k, k + 1)
+        else:
+            circuit.compose(cxs[(k + 1, k)], qubits=(k + 1, k), inplace=True)
+            circuit.compose(cxs[(k, k + 1)], qubits=(k, k + 1), inplace=True)
+
+        ## ~~rzz(angle, k + 1, j)~~
+        ## ~~swap(k, k + 1)~~
         
     return circuit
 
-def add_dynamical_decoupling(circuit, backend):
-    sched = build_schedule(circuit, backend=backend)
+def _single_step_no_first_swap_and_rzz(num_site, J, mu, omegadt, rtts=None, cxs=None):
+    circuit = QuantumCircuit(num_site)
     
-    channels_config = backend.configuration().channels
+    ## ~~swap(k, k + 1)~~
+    ## ~~rzz(angle, k + 1, j)~~
     
-    channel_qubit_map = {}
-    for channel in sched.channels:
-        channel_config = backend.configuration().channels[channel.name]
-        channel_qubit_map[channel.name] = channel_config['operates']['qubits'][0]
+    for j in range(num_site):
+        if j in (0, 1):
+            jj = 1 - j
+        else:
+            jj = j
+        angle = (mu * (-1. if jj % 2 == 0 else 1.) - J * ((num_site - jj) // 2)) * omegadt
+        circuit.rz(angle, j)
+
+    if num_site == 4:    
+        k = 0
+        ## swap(k, k + 1)
+        if cxs is None:
+            circuit.cx(k, k + 1)
+            circuit.cx(k + 1, k)
+        else:
+            circuit.compose(cxs[(k, k + 1)], qubits=(k, k + 1), inplace=True)
+            circuit.compose(cxs[(k + 1, k)], qubits=(k + 1, k), inplace=True)
+        circuit.cx(k, k + 1) # cancels with rzz below
+
+        k = 0
+        j = 1
+        angle = J * (num_site - j - 1) * omegadt
+        ## rzz(angle, k, j)
+        circuit.cx(k, j) # cancels with swap above
+        circuit.rz(angle, j)
+        if cxs is None:
+            circuit.cx(k, j)
+        else:
+            circuit.compose(cxs[(k, j)], qubits=(k, j), inplace=True)
+
+        k = 1
+        j = 2
+        angle = J * (num_site - j - 1) * omegadt
+        if rtts is None:
+            circuit.rzz(angle, k, j)
+        else:
+            circuit.compose(rtts[(k, j)].rzz_circuit(angle), qubits=(1, 2), inplace=True)
+
+    for j in range(1, num_site - 1, 2):
+        _rxxryy(num_site, circuit, omegadt, (j, j + 1), rtts=rtts)
         
-    busy_timeslots = collections.defaultdict(list)
-    for tstart, inst in sched.instructions:
-        busy_timeslots[channel_qubit_map[inst.channel.name]].append((tstart, tstart + inst.duration))
+    for j in range(0, num_site - 1, 2):
+        _rxxryy(num_site, circuit, omegadt, (j, j + 1), rtts=rtts)
+    
+    return circuit
+
+def single_step(num_site, J, mu, omegadt, rtts=None, cxs=None):
+    circuit = _single_step_no_last_rzz_and_swap(num_site, J, mu, omegadt, rtts=rtts, cxs=cxs)
+
+    if num_site == 4:
+        k = 0
+        j = 2
+        angle = J * (num_site - j - 1) * omegadt
+        ## rzz(angle, k + 1, j)
+        if rtts is None:
+            circuit.rzz(angle, k + 1, j)
+        else:
+            circuit.compose(rtts[(k + 1, j)].rzz_circuit(angle), qubits=(k + 1, j), inplace=True)
+
+        ## swap(k, k + 1)
+        if cxs is None:
+            circuit.swap(k, k + 1)
+        else:
+            circuit.compose(cxs[(k, k + 1)], qubits=(k, k + 1), inplace=True)
+            circuit.compose(cxs[(k + 1, k)], qubits=(k + 1, k), inplace=True)
+            circuit.compose(cxs[(k, k + 1)], qubits=(k, k + 1), inplace=True)
+    
+    return circuit
+
+def two_steps(num_site, J, mu, omegadt, rtts=None, cxs=None):
+    # Begin first step
+    
+    circuit = _single_step_no_last_rzz_and_swap(num_site, J, mu, omegadt, rtts=rtts, cxs=cxs)
+    
+    if num_site == 4:
+        k = 0
+        j = 2
+        angle = J * (num_site - j - 1) * omegadt
+        ## rzz(angle, k + 1, j) -> combine with rzz below
+
+        ## swap(k, k + 1) -> cancel with the swap below
+    
+    # End first step
+
+        if rtts is None:
+            circuit.rzz(2. * angle, k + 1, j)
+        else:
+            circuit.compose(rtts[(k + 1, j)].rzz_circuit(2. * angle), qubits=(k + 1, j), inplace=True)
+    
+    # Begin second step
+
+    ## swap(k, k + 1) -> cancel with the swap above
+    
+    ## rzz(angle, k + 1, j) -> combine with rzz above
+    
+    circuit.compose(_single_step_no_first_swap_and_rzz(num_site, J, mu, omegadt, rtts=rtts, cxs=cxs), inplace=True)
+    
+    # End second step
         
-    calibrations = backend.defaults().instruction_schedule_map
-    for qubit in set(channel_qubit_map.values()):
-        x_inst = calibrations.get('x', [qubit]).instructions[0][1]
-        x_duration = x_inst.duration
-            
-        interval_start = 0
-        for tstart, tend in sorted(busy_timeslots[qubit]):
-            idle_time = tstart - interval_start
-            num_insertable = idle_time // (2 * x_duration)
-            if num_insertable == 0:
-                interval_start = tend
-                continue
-                
-            with pulse.build(backend=backend) as dd_sched:
-                with pulse.align_equispaced(duration=idle_time):
-                    for _ in range(2 * num_insertable):
-                        pulse.play(x_inst.pulse, x_inst.channel)
-                    
-            dd_sched = pulse.transforms.block_to_schedule(dd_sched)
-            
-            sched.insert(interval_start, dd_sched, inplace=True)
-            
-            interval_start = tend
-            
-    return sched
+    return circuit

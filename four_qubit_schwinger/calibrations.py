@@ -16,7 +16,7 @@ from qiskit_experiments.curve_analysis import plot_curve_fit, plot_errorbar, cur
 #from qiskit_experiments.curve_analysis.curve_fit import process_curve_data
 from qiskit_experiments.curve_analysis.data_processing  import level2_probability, filter_data
 
-from cross_resonance import find_native_cr_direction, LinearizedCR
+from rttgen import find_native_cr_direction, LinearizedCR
 
 class MeasurementErrorAnalysis(BaseAnalysis):
     @classmethod
@@ -206,7 +206,7 @@ class LinearizedCRRabiExperiment(BaseExperiment):
         self.circuits_per_point = circuits_per_point
                 
     def _additional_metadata(self):
-        return [('widths', self.width_values.tolist())]
+        return {'widths': self.width_values.tolist()}
 
     def circuits(self, backend=None):
         if backend is None:

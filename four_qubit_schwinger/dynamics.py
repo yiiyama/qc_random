@@ -93,8 +93,7 @@ def insert_initial_counts(counts_list, initial_state):
 
     return [initial_counts] + counts_list
 
-
-def plot_counts_with_curve(counts_list, num_bits, J, mu, omegadt, M):
+def plot_curve(num_bits, J, mu, duration, initial_state=None):
     paulis = []
     coeffs = []
 
@@ -126,21 +125,27 @@ def plot_counts_with_curve(counts_list, num_bits, J, mu, omegadt, M):
 
     hamiltonian = make_hamiltonian(paulis, coeffs)
 
-    # Initial state as a statevector
-    initial_state = np.zeros(2 ** num_bits, dtype=np.complex128)
-    vacuum_state_index = 0
-    for j in range(1, num_bits, 2):
-        vacuum_state_index += (1 << j)
-    initial_state[vacuum_state_index] = 1.
+    if initial_state is None:
+        # Initial state as a statevector
+        initial_state = np.zeros(2 ** num_bits, dtype=np.complex128)
+        vacuum_state_index = 0
+        for j in range(1, num_bits, 2):
+            vacuum_state_index += (1 << j)
+        initial_state[vacuum_state_index] = 1.
 
     # Plot the exact solution
-    time_points_exact, statevectors = diagonalized_evolution(hamiltonian, initial_state, omegadt * M)
+    time_points_exact, statevectors = diagonalized_evolution(hamiltonian, initial_state, duration)
     
     probs_exact = np.square(np.abs(statevectors)) # shape (D, T)
     probs_list_exact = [(probs_exact[:, itime], 0) for itime in range(probs_exact.shape[1])]
     densities_exact, _ = number_density(probs_list_exact)
 
     plt.plot(time_points_exact, densities_exact)
+    
+    return probs_list_exact
+
+def plot_counts_with_curve(counts_list, num_bits, J, mu, omegadt, M, initial_state=None):
+    probs_list_exact = plot_curve(num_bits, J, mu, omegadt * M, initial_state=initial_state)
 
     # Plot the simulation results
     time_points = np.linspace(0., omegadt * M, M + 1, endpoint=True)
