@@ -3,6 +3,22 @@ import matplotlib as mpl
 import matplotlib.pyplot as plt
 from hamiltonian import diagonalized_evolution, schwinger_model
 
+def combined_counts(job, exp_block_size=1, mem_filter=None):
+    raw_counts = job.result().get_counts()
+    counts = raw_counts[:exp_block_size]
+    for iexp, cdict in enumerate(raw_counts[exp_block_size:]):
+        ic = iexp % exp_block_size
+        for key, value in cdict.items():
+            try:
+                counts[ic][key] += value
+            except KeyError:
+                counts[ic][key] = value
+                
+    if mem_filter is not None:
+        counts = mem_filter.apply(counts)
+
+    return counts
+
 def counts_to_probs(counts_list):
     """
     Args:
