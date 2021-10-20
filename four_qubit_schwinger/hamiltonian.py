@@ -103,3 +103,40 @@ def diagonalized_evolution(hamiltonian, initial_state, time, num_steps=100):
     statevectors = initial_state_matrix @ phase_factor # shape (D, T)
 
     return time_points, statevectors
+
+
+def schwinger_model(num_sites, aJ, am):
+    """
+    Return H_sch / omega = 2 a H_sch
+    """
+    
+    template = ['i'] * num_sites
+    
+    paulis = []
+    coeffs = []
+
+    for j in range(num_sites - 1):
+        term = list(template)
+        term[j] = 'x'
+        term[j + 1] = 'x'
+        paulis.append(term)
+        term = list(template)
+        term[j] = 'y'
+        term[j + 1] = 'y'
+        paulis.append(term)
+        coeffs += [0.5, 0.5] # 1/4a * 2a
+
+        for k in range(j):
+            term = list(template)
+            term[k] = 'z'
+            term[j] = 'z'
+            paulis.append(term)
+            coeffs.append(aJ * (num_sites - j - 1)) # J/2 * 2a
+
+    for j in range(num_sites):
+        term = list(template)
+        term[j] = 'z'
+        paulis.append(term)
+        coeffs.append(aJ * ((num_sites - j) // 2) + am * (1 if j % 2 == 0 else -1))
+
+    return make_hamiltonian(paulis, coeffs)

@@ -1,7 +1,7 @@
 import numpy as np
 import matplotlib as mpl
 import matplotlib.pyplot as plt
-from hamiltonian import tensor_product, make_hamiltonian, diagonalized_evolution
+from hamiltonian import diagonalized_evolution, schwinger_model
 
 def counts_to_probs(counts_list):
     """
@@ -28,7 +28,6 @@ def counts_to_probs(counts_list):
 
     return probs_list
 
-
 def number_density(probs_list, num_toys=100):
     """
     Args: probs_list (List[Tuple(ndarray, int)]): List of (probabilities, total_counts)
@@ -41,15 +40,15 @@ def number_density(probs_list, num_toys=100):
     nstates = probs_list[0][0].shape[0]
     nq = np.log2(nstates).astype(int)
     
-    # even-index qubits: '0'->0 particle '1'->1 particle
-    # odd-index qubits: '0'->1 particle '1'->0 particle
+    # even-index qubits: '0'='spin up'='occupied'='positron present'
+    # odd-index qubits: '0'='spin up'='occupied'='electron absent'
     state_densities = np.zeros((nstates,), dtype='f8')
     for iq in range(nq):
         bit_up = (np.arange(nstates) >> iq) & 1
         if iq % 2 == 0:
-            state_densities += bit_up
+            state_densities += (1 - bit_up) # bit up -> positron absent
         else:
-            state_densities += (1 - bit_up)
+            state_densities += bit_up # bit up -> electron present
         
     state_densities /= float(nq)
         
@@ -62,20 +61,20 @@ def number_density(probs_list, num_toys=100):
         if total == 0:
             continue
             
-        # Run toy experiments
-        toy_densities = np.empty((num_toys,), dtype='f8')
-        for itoy in range(num_toys):
-            toy_results = np.random.multinomial(total, probs) / total
-            toy_densities[itoy] = state_densities @ toy_results
-            
-        toy_densities = np.sort(toy_densities)
-        central_index = np.searchsorted(toy_densities, densities[itime])
-        
-        uncertainties[0, itime] = densities[itime] - toy_densities[int(central_index * 0.32)]
-        uncertainties[1, itime] = toy_densities[central_index + int((num_toys - central_index) * 0.68)] - densities[itime]
+        if num_toys > 0:
+            # Run toy experiments
+            toy_densities = np.empty((num_toys,), dtype='f8')
+            for itoy in range(num_toys):
+                toy_results = np.random.multinomial(total, probs) / total
+                toy_densities[itoy] = state_densities @ toy_results
+
+            toy_densities = np.sort(toy_densities)
+            central_index = np.searchsorted(toy_densities, densities[itime])
+
+            uncertainties[0, itime] = densities[itime] - toy_densities[int(central_index * 0.32)]
+            uncertainties[1, itime] = toy_densities[central_index + int((num_toys - central_index) * 0.68)] - densities[itime]
         
     return densities, uncertainties
-
     
 def insert_initial_counts(counts_list, initial_state):
     """Prepend a virtual 'counts' dictionary computed from the initial statevector to the counts list.
@@ -93,48 +92,21 @@ def insert_initial_counts(counts_list, initial_state):
 
     return [initial_counts] + counts_list
 
-def plot_curve(num_bits, J, mu, duration, initial_state=None):
-    paulis = []
-    coeffs = []
+def plot_curve(num_bits, aJ, am, omegat, initial_state=None):
+    # omegat = t/2a
 
-    template = ['i'] * num_bits
-
-    for j in range(num_bits - 1):
-        term = list(template)
-        term[j] = 'x'
-        term[j + 1] = 'x'
-        paulis.append(term)
-        term = list(template)
-        term[j] = 'y'
-        term[j + 1] = 'y'
-        paulis.append(term)
-        coeffs += [0.5, 0.5]
-
-        for k in range(j):
-            term = list(template)
-            term[k] = 'z'
-            term[j] = 'z'
-            paulis.append(term)
-            coeffs.append(0.5 * J * (num_bits - j - 1.))
-
-    for j in range(num_bits):
-        term = list(template)
-        term[j] = 'z'
-        paulis.append(term)
-        coeffs.append(-0.5 * J * ((num_bits - j) // 2) + 0.5 * mu * (-1. if j % 2 == 0 else 1.))
-
-    hamiltonian = make_hamiltonian(paulis, coeffs)
+    hamiltonian = schwinger_model(num_bits, aJ, am)
 
     if initial_state is None:
         # Initial state as a statevector
         initial_state = np.zeros(2 ** num_bits, dtype=np.complex128)
         vacuum_state_index = 0
-        for j in range(1, num_bits, 2):
+        for j in range(0, num_bits, 2):
             vacuum_state_index += (1 << j)
         initial_state[vacuum_state_index] = 1.
 
     # Plot the exact solution
-    time_points_exact, statevectors = diagonalized_evolution(hamiltonian, initial_state, duration)
+    time_points_exact, statevectors = diagonalized_evolution(hamiltonian, initial_state, omegat)
     
     probs_exact = np.square(np.abs(statevectors)) # shape (D, T)
     probs_list_exact = [(probs_exact[:, itime], 0) for itime in range(probs_exact.shape[1])]
@@ -144,15 +116,16 @@ def plot_curve(num_bits, J, mu, duration, initial_state=None):
     
     return probs_list_exact
 
-def plot_counts_with_curve(counts_list, num_bits, J, mu, omegadt, M, initial_state=None):
-    probs_list_exact = plot_curve(num_bits, J, mu, omegadt * M, initial_state=initial_state)
+def plot_counts_with_curve(counts_list, num_bits, aJ, am, omegadt, M, initial_state=None, num_toys=100):
+    probs_list_exact = plot_curve(num_bits, aJ, am, omegadt * M, initial_state=initial_state)
 
     # Plot the simulation results
     time_points = np.linspace(0., omegadt * M, M + 1, endpoint=True)
     probs_list = counts_to_probs(counts_list)
     
     probs_list.insert(0, probs_list_exact[0])
-    densities, uncertainties = number_density(probs_list)
+    densities, uncertainties = number_density(probs_list, num_toys=num_toys)
 
     plt.scatter(time_points, densities)
-    plt.errorbar(time_points, densities, yerr=uncertainties, elinewidth=1, linewidth=0)
+    if num_toys > 0:
+        plt.errorbar(time_points, densities, yerr=uncertainties, elinewidth=1, linewidth=0)
