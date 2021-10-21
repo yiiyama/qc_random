@@ -1,4 +1,8 @@
-
+from typing import Tuple
+import numpy as np
+import scipy.optimize as sciopt
+from qiskit import QuantumCircuit, QuantumRegister, converters, transpile
+from qiskit.circuit import ParameterVector
 
 #####################################################################################################
 ### ANSATZ ##########################################################################################
@@ -135,6 +139,7 @@ class FISCPNP:
                 loss_value = None
 
             theta, ncall, loss_value = self._smo_one_iter(param_val, iparam, loss_value)
+            print('niter', niter, 'iparam', iparam, 'loss', loss_value)
 
             param_val[iparam] = theta
             nfuncall += ncall
@@ -194,7 +199,7 @@ class FISCPNP:
     
     def _compute_costs(self, circuits):
         for circuit in circuits:
-            circuit.measure_all()
+            circuit.measure(circuit.qregs[0], circuit.cregs[0])
         
         if self.backend.configuration().simulator:
             circuits = transpile(circuits, backend=self.backend, initial_layout=self.physical_qubits, optimization_level=1)

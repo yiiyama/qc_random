@@ -108,6 +108,8 @@ def diagonalized_evolution(hamiltonian, initial_state, time, num_steps=100):
 def schwinger_model(num_sites, aJ, am):
     """
     Return H_sch / omega = 2 a H_sch
+    
+    H_{\mathrm{sch}} = \frac{1}{4a} \sum_{j=0}^{N-2} (X_j X_{j+1} + Y_j Y_{j+1}) + \frac{J}{2} \sum_{j=0}^{N-2} (N - j - 1) Z_j \sum_{k=0}^{j-1} Z_k + \frac{1}{2} \sum_{j=0}^{N-1} \left[ J \left\lfloor \frac{N - j}{2} \right\rfloor + (-1)^{j} m \right]
     """
     
     template = ['i'] * num_sites
