@@ -101,7 +101,7 @@ def _single_step_no_first_swap_and_rzz(num_sites, aJ, am, omegadt, rtts=None, cx
     ## ~~rzz(angle, k + 1, j)~~
     
     for j in range(num_sites):
-        if j in (0, 1):
+        if num_sites == 4 and j in (0, 1):
             jj = 1 - j
         else:
             jj = j

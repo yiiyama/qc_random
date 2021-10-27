@@ -1,7 +1,8 @@
 from typing import Tuple
 import numpy as np
 import scipy.optimize as sciopt
-from qiskit import QuantumCircuit, QuantumRegister, converters, transpile
+import scipy.stats as scistats
+from qiskit import Aer, QuantumCircuit, QuantumRegister, converters, transpile
 from qiskit.circuit import ParameterVector
 
 #####################################################################################################
@@ -73,19 +74,275 @@ def make_ansatz(
 #####################################################################################################
 
 def global_cost_function(prob_dist):
-    return -prob_dist[0]
+    return 1. - prob_dist[0]
 
 def local_cost_function(prob_dist):
-    local_cost_function = 0.
+    sump = 0.
     num_qubit = int(np.log2(len(prob_dist)))
     for iqubit in range(num_qubit):
         for idx, prob in enumerate(prob_dist):
             if (not ( (idx>>iqubit) & 1 )):
-                local_cost_function += prob
-    local_cost_function /= num_qubit
-    local_cost_function *= -1.
+                sump += prob
 
-    return local_cost_function
+    return 1. - sump / num_qubit
+
+def general_cost_function(prob_dist, q):
+    global_cost = global_cost_function(prob_dist)
+    local_cost = local_cost_function(prob_dist)
+    return q * global_cost + (1. - q) * local_cost
+
+#####################################################################################################
+### CONST FUNCTION SLICE GENERATORS #################################################################
+#####################################################################################################
+
+class CostFunctionSliceAllTerms(object):
+    def __init__(self):
+        self.hop_suppression_threshold = 1.e-4
+        self.coeffs = np.zeros(5, dtype='f8')
+        self.current = 0.
+    
+    def fun(self, theta):
+        return self.coeffs[0] * np.sin(2. * theta) + \
+                self.coeffs[1] * np.cos(2. * theta) + \
+                self.coeffs[2] * np.sin(theta) + \
+                self.coeffs[3] * np.cos(theta) + \
+                self.coeffs[4]
+    
+    def grad(self, theta):
+        return 2. * self.coeffs[0] * np.cos(2. * theta) + \
+                (-2. * self.coeffs[1]) * np.sin(2. * theta) + \
+                self.coeffs[2] * np.cos(theta) + \
+                (-self.coeffs[3]) * np.sin(theta)
+    
+    def minimize(self):
+        if self.grad(0.) < 0.:
+            x0 = 0.
+            shift = 0.01
+        else:
+            x0 = 2. * np.pi
+            shift = -0.01
+            
+        fun_array_input = lambda x: self.fun(x[0])
+
+        # first minimum
+        res_min1 = sciopt.minimize(fun_array_input, [x0], method='Newton-CG', jac=self.grad)
+
+        negative_fun_array_input = lambda x: -self.fun(x[0])
+        negative_grad = lambda x: -self.grad(x)
+        
+        # first maximum
+        res_max1 = sciopt.minimize(negative_fun_array_input, [res_min1.x + shift], method='Newton-CG', jac=negative_grad)
+        
+        # second minimum
+        res_min2 = sciopt.minimize(fun_array_input, [res_max1.x + shift], method='Newton-CG', jac=self.grad)
+        
+        if (shift > 0. and res_min2.x > 2. * np.pi) or (shift < 0. and res_min2.x < 0.)
+            return res_min1.x
+        elif abs(res_min1.fun - res_min2.fun) < self.hop_suppression_threshold:
+            if abs(res_min1.x - self.current) < abs(res_min2.x - self.current):
+                return res_min1.x
+            else:
+                return res_min2.x
+        elif res_min1.fun < res_min2.fun:
+            return res_min1.x
+        else:
+            return res_min2.x
+        
+class CostFunctionSliceFirst(object):
+    def __init__(self):
+        self.coeffs = np.zeros(3, dtype='f8')
+    
+    def fun(self, theta):
+        return self.coeffs[0] * np.sin(theta) + \
+                self.coeffs[1] * np.cos(theta) + \
+                self.coeffs[2]
+    
+    def grad(self, theta):
+        return self.coeffs[0] * np.cos(theta) + \
+                (-self.coeffs[1]) * np.sin(theta)
+    
+    def minimize(self):
+        theta_min = np.arctan2(self.coeffs[0], self.coeffs[1]) + np.pi
+        if theta_min < 0.:
+            theta_min += 2. * np.pi
+        elif theta_min > 2. * np.pi:
+            theta_min -= 2. * np.pi
+
+        return theta_min
+
+class CostFunctionSliceSecond(object):
+    def __init__(self):
+        self.coeffs = np.zeros(3, dtype='f8')
+        self.current = 0.
+    
+    def fun(self, theta):
+        return self.coeffs[0] * np.sin(2. * theta) + \
+                self.coeffs[1] * np.cos(2. * theta) + \
+                self.coeffs[2]
+    
+    def grad(self, theta):
+        return 2. * self.coeffs[0] * np.cos(2. * theta) + \
+                (-2. * self.coeffs[1]) * np.sin(2. * theta)
+    
+    def minimize(self):
+        theta_min = np.arctan2(self.coeffs[0], self.coeffs[1]) / 2. + np.pi / 2.
+        if theta_min < 0.:
+            theta_min += 2. * np.pi
+        elif theta_min > 2. * np.pi:
+            theta_min -= 2. * np.pi
+            
+        if abs(theta_min - self.current) > np.pi / 2.:
+            if theta_min < np.pi:
+                theta_min += np.pi
+            else:
+                theta_min -= np.pi
+
+        return theta_min
+
+
+class AnalyticAllTerms(CostFunctionSliceAllTerms):
+    def set_thetas(self, current):
+        self.current = current
+        self.thetas = np.array([current, current + np.pi / 4., current - np.pi / 4., current + np.pi / 2., current - np.pi / 2.])
+        
+    def set_coeffs(self, costs):
+        z0, z1, z2, z3, z4 = costs
+
+        self.coeffs[4] = (np.sqrt(2) * (z1 + z2) - z4 - z3 - 2 * z0) / (2 * np.sqrt(2) - 4)
+        self.coeffs[2] = (
+            1
+            / 2.0
+            * (
+                (z3 - z4) * np.cos(self.current)
+                + np.sqrt(2) * (z1 + z2) * np.sin(self.current)
+                - 2 * np.sqrt(2) * self.coeffs[4] * np.sin(self.current)
+            )
+        )
+        self.coeffs[3] = (
+            -1
+            / 2.0
+            * (
+                (z3 - z4) * np.sin(self.current)
+                - np.sqrt(2) * (z1 + z2) * np.cos(self.current)
+                + 2 * np.sqrt(2) * self.coeffs[4] * np.cos(self.current)
+            )
+        )
+        self.coeffs[1] = (
+            np.cos(2 * self.current) * (self.coeffs[2] * np.cos(self.current) - self.coeffs[3] * np.sin(self.current) + self.coeffs[4])
+            + np.sin(2 * self.current)
+            * (
+                (self.coeffs[2] + self.coeffs[3]) * np.cos(self.current) / np.sqrt(2)
+                + (self.coeffs[2] - self.coeffs[3]) * np.sin(self.current) / np.sqrt(2)
+                + self.coeffs[4]
+            )
+            - z3 * np.cos(2 * self.current)
+            - z1 * np.sin(2 * self.current)
+        )
+        self.coeffs[0] = (
+            np.sin(2 * self.current) * (self.coeffs[2] * np.cos(self.current) - self.coeffs[3] * np.sin(self.current) + self.coeffs[4])
+            - np.cos(2 * self.current)
+            * (
+                (self.coeffs[2] + self.coeffs[3]) * np.cos(self.current) / np.sqrt(2)
+                + (self.coeffs[2] - self.coeffs[3]) * np.sin(self.current) / np.sqrt(2)
+                + self.coeffs[4]
+            )
+            - z3 * np.sin(2 * self.current)
+            + z1 * np.cos(2 * self.current)
+        )
+    
+class AnalyticSecond(CostFunctionSliceSecond):
+    def set_thetas(self, current):
+        self.current = current
+        self.thetas = np.array([current, current + np.pi / 4., current - np.pi / 4.])
+        
+    def set_coeffs(self, costs):
+        z0, z1, z2 = costs
+
+        self.coeffs[2] = (z1 + z2) / 2.
+        
+        c = np.cos(2. * self.current)
+        s = np.sin(2. * self.current)
+        
+        self.coeffs[0] = ((z0 - z2) * (c + s) - (z0 - z1) * (c - s)) / 2.
+        self.coeffs[1] = ((z0 - z2) * (c - s) + (z0 - z1) * (c + s)) / 2.
+    
+class AnalyticFirst(CostFunctionSliceFirst):
+    def set_thetas(self, current):
+        self.thetas = np.array([current, current + np.pi / 2., current - np.pi / 2.])
+        
+    def set_coeffs(self, costs):
+        z0, z1, z2 = costs
+
+        self.coeffs[2] = (z1 + z2) / 2.
+        
+        c = np.cos(self.current)
+        s = np.sin(self.current)
+        
+        self.coeffs[0] = ((z0 - z2) * (c + s) - (z0 - z1) * (c - s)) / 2.
+        self.coeffs[1] = ((z0 - z2) * (c - s) + (z0 - z1) * (c + s)) / 2.
+    
+class MatrixCostFunctionSlice(object):
+    def set_coeffs(self, costs):
+        self.coeffs = self.inverse_matrix @ costs
+    
+class MatrixAllTerms(CostFunctionSliceAllTerms, MatrixCostFunctionSlice):
+    def set_thetas(self, current):
+        self.thetas = np.linspace(current - np.pi / 2., current + np.pi / 2., 5, endpoint=True)
+        matrix = np.stack((np.sin(2. * self.thetas), np.cos(2. * self.thetas), np.sin(self.thetas), np.cos(self.thetas), np.ones_like(self.thetas)), axis=1)
+        self.inverse_matrix = np.linalg.inv(matrix)
+        self.current = current
+    
+class MatrixSecond(CostFunctionSliceSecond, MatrixCostFunctionSlice):
+    def set_thetas(self, current):
+        self.thetas = np.linspace(current - np.pi / 4., current + np.pi / 4., 3, endpoint=True)
+        matrix = np.stack((np.sin(2. * self.thetas), np.cos(2. * self.thetas), np.ones_like(self.thetas)), axis=1)
+        self.inverse_matrix = np.linalg.inv(matrix)
+        self.current = current
+        
+class MatrixFirst(CostFunctionSliceFirst, MatrixCostFunctionSlice):
+    def set_thetas(self, current):
+        self.thetas = np.linspace(current - np.pi / 2., current + np.pi / 2., 3, endpoint=True)
+        matrix = np.stack((np.sin(self.thetas), np.cos(self.thetas), np.ones_like(self.thetas)), axis=1)
+        self.inverse_matrix = np.linalg.inv(matrix)
+        
+class FitCostFunctionSlice(object):
+    def __init__(self, points_coeff_ratio=4):
+        self.ratio = points_coeff_ratio
+    
+    def set_coeffs(self, costs):
+        # Assuming global cost, cost = 1-prob_dist[0]
+        # -> binomial distribution
+
+        def negative_likelihood(coeffs):
+            x = self.template_matrix @ coeffs
+            return -np.prod(scistats.beta.pdf(x, costs + 1., (1. - costs) + 1.))
+
+        b0 = np.linalg.inv(self.template_matrix[::self.ratio, :]) @ costs[::self.ratio]
+
+        res = sciopt.minimize(negative_likelihood, b0)
+
+        self.coeffs = res.x
+    
+class FitAllTerms(CostFunctionSliceAllTerms, FitCostFunctionSlice):
+    def __init__(self, points_coeff_ratio=4):
+        CostFunctionSliceAllTerms.__init__(self)
+        FitCostFunctionSlice.__init__(self, points_coeff_ratio)
+        
+    def set_thetas(self, current):
+        self.thetas = np.linspace(current - np.pi, current + np.pi, 5 * self.ratio, endpoint=False)
+        self.template_matrix = np.stack((np.sin(2. * self.thetas), np.cos(2. * self.thetas), np.sin(self.thetas), np.cos(self.thetas), np.ones_like(self.thetas)), axis=1)
+        self.current = current
+    
+class FitSecond(CostFunctionSliceSecond, FitCostFunctionSlice):
+    def set_thetas(self, current):
+        self.thetas = np.linspace(current - np.pi, current + np.pi, 3 * self.ratio, endpoint=False)
+        self.template_matrix = np.stack((np.sin(2. * self.thetas), np.cos(2. * self.thetas), np.ones_like(self.thetas)), axis=1)
+        self.current = current
+    
+class FitFirst(CostFunctionSliceFirst, FitCostFunctionSlice):
+    def set_thetas(self, current):
+        self.thetas = np.linspace(current - np.pi, current + np.pi, 3 * self.ratio, endpoint=False)
+        self.template_matrix = np.stack((np.sin(self.thetas), np.cos(self.thetas), np.ones_like(self.thetas)), axis=1)
 
 #####################################################################################################
 ### FISCPNP #########################################################################################
@@ -101,7 +358,9 @@ class FISCPNP:
         physical_qubits=None,
         num_experiments=1,
         shots=8192,
-        error_mitigation_filter=None
+        error_mitigation_filter=None,
+        default_slice_gen=MatrixAllTerms,
+        seed=12345
     ):
         self.qc_target = qc_target
         self.qc_ansatz, self.param_vec = ansatz
@@ -118,36 +377,100 @@ class FISCPNP:
         
         self.error_mitigation_filter = error_mitigation_filter
         
+        self.cost_slice_generators = [default_slice_gen for _ in range(len(self.param_vec))]
+        
+        self.random_gen = np.random.default_rng(seed)
+        
+        self.statevector_simulator = None
+        self.ideal_costs_step = None
+        self.ideal_costs_sweep = None
+        
     def smo(
         self,
         initial_param_val,
-        maxfuncall=100,
-        reset_interval=1,
+        max_sweeps=10,
+        callbacks_step=[],
+        callbacks_sweep=[]
     ):
         assert len(initial_param_val) == len(self.param_vec)
         param_val = np.array(initial_param_val)
+        sweep_param_val = param_val.copy()
 
-        loss_values = []
-        loss_value = None
-        nfuncall = 0
+        cost_values = []
+        nexp = 0
         iparam = 0
-        niter = 0
+        
+        convergence_distance = 1.e-2
+        convergence_cost = 1.e-5
+        
+        current_sweep_mean_cost = 1.
+        
+        for isweep in range(max_sweeps):
+            sweep_mean_cost = 0.
+            
+            for iparam in range(len(self.param_vec)):
+                cost_slice, costs = self._smo_one_iter(sweep_param_val, iparam)
+                
+                theta_opt = cost_slice.minimize()
+                
+                for callback in callbacks_step:
+                    callback(isweep, iparam, sweep_param_val, theta_opt, costs, cost_slice)
 
-        while nfuncall < maxfuncall:
-            niter += 1
-            if niter % reset_interval == 0:
-                loss_value = None
+                sweep_param_val[iparam] = theta_opt
+                nexp += len(thetas) * self.num_experiments
 
-            theta, ncall, loss_value = self._smo_one_iter(param_val, iparam, loss_value)
-            print('niter', niter, 'iparam', iparam, 'loss', loss_value)
+                cost_value = cost_slice.fun(theta_opt)
+                cost_values.append(cost_value)
+                
+                sweep_mean_cost += cost_value
+                
+            for callback in callbacks_sweep:
+                callback(isweep, param_val, sweep_param_val)
+                
+            distance = np.max(np.abs(param_val - sweep_param_val))
+            
+            if distance < convergence_distance:
+                break
+                
+            sweep_mean_cost /= len(self.param_vec)
+            
+            if abs(sweep_mean_cost - current_sweep_mean_cost) < convergence_cost:
+                break
+                
+            current_sweep_mean_cost = sweep_mean_cost
+            param_val = sweep_param_val.copy()
 
-            param_val[iparam] = theta
-            nfuncall += ncall
-            loss_values.append(loss_value)
+        return param_val, cost_values, nexp
+    
+    def ideal_cost_step(self, isweep, iparam, sweep_param_val, theta_opt, costs, cost_slice):
+        """Convenience function for tracking the ideal cost through callback
+        """
+        if self.statevector_simulator is None:
+            self.statevector_simulator = Aer.get_backend('statevector_simulator')
 
-            iparam = (iparam + 1) % len(self.param_vec)
+        if self.ideal_costs_step is None:
+            self.ideal_costs_step = []
+            
+        circuit = transpile(self._make_circuit(sweep_param_val, iparam, theta_opt), backend=self.statevector_simulator)
+        prob_dist = np.square(np.abs(self.statevector_simulator.run(circuit).result().data()['statevector']))
+        cost = general_cost_function(prob_dist, self.q)
+        
+        self.ideal_costs_step.append(cost)
+        
+    def ideal_cost_sweep(self, isweep, param_val, sweep_param_val):
+        """Convenience function for tracking the ideal cost through callback
+        """
+        if self.statevector_simulator is None:
+            self.statevector_simulator = Aer.get_backend('statevector_simulator')
 
-        return param_val, nfuncall, loss_values[1:]
+        if self.ideal_costs_sweep is None:
+            self.ideal_costs_sweep = []
+            
+        circuit = transpile(self._make_circuit(sweep_param_val), backend=self.statevector_simulator)
+        prob_dist = np.square(np.abs(self.statevector_simulator.run(circuit).result().data()['statevector']))
+        cost = general_cost_function(prob_dist, self.q)
+        
+        self.ideal_costs_sweep.append(cost)
 
     def _conjugate_ansatz(
         self,
@@ -163,157 +486,118 @@ class FISCPNP:
                 )
         return converters.dag_to_circuit(dag)
     
-    def _make_circuit(self, param_val, param_id, shift):
-        local_params = np.copy(param_val)
-        local_params[param_id] += shift
-        param_dict = dict(zip(self.param_vec, local_params))
+    def _make_circuit(self, param_val, param_id=None, test_value=None):
+        if param_id is not None:
+            param_val = np.copy(param_val)
+            param_val[param_id] = test_value
+            
+        param_dict = dict(zip(self.param_vec, param_val))
         
         return self.qc_learning.bind_parameters(param_dict)
     
-    def _get_probabilities(self, raw_counts):
-        num_circuits = len(raw_counts) // self.num_experiments
-        counts_list = [dict() for _ in range(num_circuits)]
-
-        for iexp, cdict in enumerate(raw_counts):
-            ic = iexp // self.num_experiments
-            for key, value in cdict.items():
-                try:
-                    counts_list[ic][key] += value
-                except KeyError:
-                    counts_list[ic][key] = value
-
-        if self.error_mitigation_filter is not None:
-            corrected_counts_list = []
-            for counts in counts_list:
-                corrected_counts_list.append(self.error_mitigation_filter.apply(counts))
-                
-            counts_list = corrected_counts_list
-
-        probs = [np.zeros(2 ** self.qc_target.num_qubits, dtype='f8') for _ in range(num_circuits)]
-        for ic, counts in enumerate(counts_list):
-            total = sum(counts.values())
-            for key, value in counts.items():
-                probs[ic][int(key, 2)] = value / total
-                
-        return probs
-    
-    def _compute_costs(self, circuits):
-        for circuit in circuits:
-            circuit.measure(circuit.qregs[0], circuit.cregs[0])
+    def _run_circuits(self, circuits):
+        if self.backend.name() != 'statevector_simulator':
+            for circuit in circuits:
+                circuit.measure(circuit.qregs[0], circuit.cregs[0])
         
         if self.backend.configuration().simulator:
             circuits = transpile(circuits, backend=self.backend, initial_layout=self.physical_qubits, optimization_level=1)
         else:
             circuits = transpile_with_dynamical_decoupling(circuits, backend=self.backend, initial_layout=self.physical_qubits, optimization_level=1)
-
-        circuits_to_run = []
-        for circuit in circuits:
-            circuits_to_run += [circuit] * self.num_experiments
             
-        counts = self.backend.run(circuits_to_run, shots=self.shots).result().get_counts()
-        
-        prob_dists = self._get_probabilities(counts)
-
-        costs = []
-        for prob_dist in prob_dists:
-            global_cost = global_cost_function(prob_dist)
-            local_cost = local_cost_function(prob_dist)
-            costs.append(self.q * global_cost + (1-self.q) * local_cost)
+        if self.backend.name() == 'statevector_simulator':
+            result = self.backend.run(circuits).result()
             
-        return costs
+            total_shots = self.shots * self.num_experiments
+            
+            probs = []
+            for res in result.results:
+                exact = np.square(np.abs(res.data.statevector))
+                if total_shots <= 0:
+                    probs.append(exact)
+                else:
+                    counts = self.random_gen.multinomial(total_shots, exact)
+                    probs.append(counts / total_shots)
+                
+        else:
+            circuits_to_run = []
+            for circuit in circuits:
+                circuits_to_run += [circuit] * self.num_experiments
+
+            raw_counts = self.backend.run(circuits_to_run, shots=self.shots).result().get_counts()
+            if len(circuits_to_run) == 1:
+                num_circuits = 1
+                counts_list = [raw_counts]
+            else:
+                num_circuits = len(raw_counts) // self.num_experiments
+                counts_list = [dict() for _ in range(num_circuits)]
+
+                for iexp, cdict in enumerate(raw_counts):
+                    ic = iexp // self.num_experiments
+                    for key, value in cdict.items():
+                        try:
+                            counts_list[ic][key] += value
+                        except KeyError:
+                            counts_list[ic][key] = value
+
+            if self.error_mitigation_filter is not None:
+                corrected_counts_list = []
+                for counts in counts_list:
+                    corrected_counts_list.append(self.error_mitigation_filter.apply(counts))
+
+                counts_list = corrected_counts_list
+
+            probs = [np.zeros(2 ** self.qc_target.num_qubits, dtype='f8') for _ in range(num_circuits)]
+            for ic, counts in enumerate(counts_list):
+                total = sum(counts.values())
+                for key, value in counts.items():
+                    probs[ic][int(key, 2)] = value / total
+                
+        return probs
         
+    def _compute_costs(self, circuits, num_toys=None):
+        prob_dists = self._run_circuits(circuits)
+        
+        costs = np.empty(len(prob_dists), dtype='f8')
+        for iprob, prob_dist in enumerate(prob_dists):
+            costs[iprob] = general_cost_function(prob_dist, self.q)
+            
+        if not num_toys:
+            return costs
+        
+        shots = self.shots * self.num_experiments
+        sigmas = np.empty_like(costs)
+        
+        for iprob, prob_dist in enumerate(prob_dists):
+            sumw = 0.
+            sumw2 = 0.
+            for _ in range(num_toys):
+                toy_prob_dist = self.random_gen.multinomial(shots, prob_dist) / shots
+                toy_cost = general_cost_function(toy_prob_dist, self.q)
+                sumw += toy_cost
+                sumw2 += toy_cost * toy_cost
+            
+            mean = sumw / num_toys
+            sigmas[iprob] = np.sqrt(sumw2 / num_toys - mean * mean)
+            
+        return costs, sigmas
+    
     def _smo_one_iter(
         self,
         param_val,
-        param_id,
-        z0
+        param_id
     ):
-        p_ = param_val[param_id]
+        current = param_val[param_id]
         
-        nfuncall = 0
+        cost_slice = self.cost_slice_generators[param_id]()
+        cost_slice.set_thetas(current)
+        
         circuits = []
-
-        if z0 is None:
-            circuits.append(self._make_circuit(param_val, param_id, 0.))
-
-        circuits.append(self._make_circuit(param_val, param_id, np.pi / 4.))
-        circuits.append(self._make_circuit(param_val, param_id, -np.pi / 4.))
-        circuits.append(self._make_circuit(param_val, param_id, np.pi / 2.))
-        circuits.append(self._make_circuit(param_val, param_id, -np.pi / 2.))
+        for theta in cost_slice.thetas:
+            circuits.append(self._make_circuit(param_val, param_id, theta))
         
         costs = self._compute_costs(circuits)
-        nfuncall += len(circuits)
         
-        if z0 is None:
-            z0, z1, z2, z3, z4 = costs
-        else:
-            z1, z2, z3, z4 = costs
+        cost_slice.set_coeffs(costs)
 
-        b = np.zeros(5)
-        b[4] = (np.sqrt(2) * (z1 + z2) - z4 - z3 - 2 * z0) / (2 * np.sqrt(2) - 4)
-        b[2] = (
-            1
-            / 2.0
-            * (
-                (z3 - z4) * np.cos(p_)
-                + np.sqrt(2) * (z1 + z2) * np.sin(p_)
-                - 2 * np.sqrt(2) * b[4] * np.sin(p_)
-            )
-        )
-        b[3] = (
-            -1
-            / 2.0
-            * (
-                (z3 - z4) * np.sin(p_)
-                - np.sqrt(2) * (z1 + z2) * np.cos(p_)
-                + 2 * np.sqrt(2) * b[4] * np.cos(p_)
-            )
-        )
-        b[1] = (
-            np.cos(2 * p_) * (b[2] * np.cos(p_) - b[3] * np.sin(p_) + b[4])
-            + np.sin(2 * p_)
-            * (
-                (b[2] + b[3]) * np.cos(p_) / np.sqrt(2)
-                + (b[2] - b[3]) * np.sin(p_) / np.sqrt(2)
-                + b[4]
-            )
-            - z3 * np.cos(2 * p_)
-            - z1 * np.sin(2 * p_)
-        )
-        b[0] = (
-            np.sin(2 * p_) * (b[2] * np.cos(p_) - b[3] * np.sin(p_) + b[4])
-            - np.cos(2 * p_)
-            * (
-                (b[2] + b[3]) * np.cos(p_) / np.sqrt(2)
-                + (b[2] - b[3]) * np.sin(p_) / np.sqrt(2)
-                + b[4]
-            )
-            - z3 * np.sin(2 * p_)
-            + z1 * np.cos(2 * p_)
-        )
-
-        # calculate minimum point of f
-        def f(theta, b):
-            return (
-                b[0] * np.sin(2 * theta)
-                + b[1] * np.cos(2 * theta)
-                + b[2] * np.sin(theta)
-                + b[3] * np.cos(theta)
-                + b[4]
-            )
-
-        l = 0
-        r = 2 * np.pi
-        theta = 0
-        cost = 1.0
-
-        eps = 1e-16
-        Ns = 10000
-
-        while r - l > eps:
-            result = sciopt.brute(f, ranges=((l, r),), args=(b,), full_output=True, Ns=Ns)
-            theta = result[0][0]
-            cost = result[1]
-            l, r = theta - (r - l) / Ns, theta + (r - l) / Ns
-
-        return theta, nfuncall, z0
+        return cost_slice, costs
