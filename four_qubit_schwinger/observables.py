@@ -132,11 +132,11 @@ def plot_curve(num_bits, aJ, am, omegat, initial_state=None):
     
     return probs_list_exact
 
-def plot_counts_with_curve(counts_list, num_bits, aJ, am, omegadt, M, initial_state=None, num_toys=100):
-    probs_list_exact = plot_curve(num_bits, aJ, am, omegadt * M, initial_state=initial_state)
+def plot_counts_with_curve(counts_list, num_bits, aJ, am, omegadt, num_tsteps, initial_state=None, num_toys=100):
+    probs_list_exact = plot_curve(num_bits, aJ, am, omegadt * num_tsteps, initial_state=initial_state)
 
     # Plot the simulation results
-    time_points = np.linspace(0., omegadt * M, M + 1, endpoint=True)
+    time_points = np.linspace(0., omegadt * num_tsteps, num_tsteps + 1, endpoint=True)
     probs_list = counts_to_probs(counts_list)
     
     probs_list.insert(0, probs_list_exact[0])
