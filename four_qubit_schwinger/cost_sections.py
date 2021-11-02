@@ -8,26 +8,35 @@ class CostSectionGeneral:
         self.coeffs = np.zeros(5, dtype='f8')
         self.current = 0.
     
-    def fun(self, theta):
+    def fun(self, theta=None):
+        if theta is None:
+            theta = self.current
+            
         return self.coeffs[0] * np.sin(2. * theta) + \
                 self.coeffs[1] * np.cos(2. * theta) + \
                 self.coeffs[2] * np.sin(theta) + \
                 self.coeffs[3] * np.cos(theta) + \
                 self.coeffs[4]
     
-    def grad(self, theta):
+    def grad(self, theta=None):
+        if theta is None:
+            theta = self.current
+            
         return 2. * self.coeffs[0] * np.cos(2. * theta) + \
                 (-2. * self.coeffs[1]) * np.sin(2. * theta) + \
                 self.coeffs[2] * np.cos(theta) + \
                 (-self.coeffs[3]) * np.sin(theta)
     
-    def hess(self, theta):
+    def hess(self, theta=None):
+        if theta is None:
+            theta = self.current
+            
         return -4. * self.coeffs[0] * np.sin(2. * theta) + \
                 (-4. * self.coeffs[1]) * np.cos(2. * theta) + \
                 (-self.coeffs[2]) * np.sin(theta) + \
                 (-self.coeffs[3]) * np.cos(theta)
     
-    def minimize(self):
+    def minimum(self):
         def find_next_optimum(x0, fun, grad, hess):
             return sciopt.minimize(fun, [x0], method='trust-ncg', jac=grad, hess=hess, options={'initial_trust_radius': np.pi / 8.})
         
@@ -71,20 +80,30 @@ class CostSectionGeneral:
 class CostSectionFirst:
     def __init__(self):
         self.coeffs = np.zeros(3, dtype='f8')
+        self.current = 0.
     
-    def fun(self, theta):
+    def fun(self, theta=None):
+        if theta is None:
+            theta = self.current
+            
         return self.coeffs[0] * np.sin(theta) + \
                 self.coeffs[1] * np.cos(theta) + \
                 self.coeffs[2]
     
-    def grad(self, theta):
+    def grad(self, theta=None):
+        if theta is None:
+            theta = self.current
+            
         return self.coeffs[0] * np.cos(theta) + \
                 (-self.coeffs[1]) * np.sin(theta)
     
-    def hess(self, theta):
+    def hess(self, theta=None):
+        if theta is None:
+            theta = self.current
+            
         return -1. * (self.fun(theta) - self.coeffs[2])
     
-    def minimize(self):
+    def minimum(self):
         theta_min = np.arctan2(self.coeffs[0], self.coeffs[1]) + np.pi
         if theta_min < 0.:
             theta_min += 2. * np.pi
@@ -98,19 +117,28 @@ class CostSectionSecond:
         self.coeffs = np.zeros(3, dtype='f8')
         self.current = 0.
     
-    def fun(self, theta):
+    def fun(self, theta=None):
+        if theta is None:
+            theta = self.current
+        
         return self.coeffs[0] * np.sin(2. * theta) + \
                 self.coeffs[1] * np.cos(2. * theta) + \
                 self.coeffs[2]
     
-    def grad(self, theta):
+    def grad(self, theta=None):
+        if theta is None:
+            theta = self.current
+            
         return 2. * self.coeffs[0] * np.cos(2. * theta) + \
                 (-2. * self.coeffs[1]) * np.sin(2. * theta)
     
-    def hess(self, theta):
+    def hess(self, theta=None):
+        if theta is None:
+            theta = self.current
+            
         return -4. * (self.fun(theta) - self.coeffs[2])
     
-    def minimize(self):
+    def minimum(self):
         theta_min = np.arctan2(self.coeffs[0], self.coeffs[1]) / 2. + np.pi / 2.
         if theta_min < 0.:
             theta_min += 2. * np.pi
@@ -128,27 +156,36 @@ class CostSectionSecond:
 class CostSectionSymmetric:
     def __init__(self):
         self.coeffs = np.zeros(3, dtype='f8')
-        self.minimum = 0.
+        self.theta_opt = 0.
         self.current = 0.
     
-    def fun(self, theta):
-        x = theta - self.minimum
+    def fun(self, theta=None):
+        if theta is None:
+            theta = self.current
+        
+        x = theta - self.theta_opt
         return self.coeffs[0] * np.cos(2. * x) + \
                 self.coeffs[1] * np.cos(x) + \
                 self.coeffs[2]
     
-    def grad(self, theta):
-        x = theta - self.minimum
+    def grad(self, theta=None):
+        if theta is None:
+            theta = self.current
+        
+        x = theta - self.theta_opt
         return (-2. * self.coeffs[0]) * np.sin(2. * x) + \
                 (-self.coeffs[1]) * np.sin(x)
     
-    def hess(self, theta):
-        x = theta - self.minimum
+    def hess(self, theta=None):
+        if theta is None:
+            theta = self.current
+
+        x = theta - self.theta_opt
         return (-4. * self.coeffs[0]) * np.cos(2. * x) + \
                 (-self.coeffs[1]) * np.cos(x)
     
-    def minimize(self):
-        return self.minimum
+    def minimum(self):
+        return self.theta_opt
 
 
 class ManualGeneral(CostSectionGeneral):
@@ -219,6 +256,7 @@ class ManualSecond(CostSectionSecond):
     
 class ManualFirst(CostSectionFirst):
     def set_thetas(self, current):
+        self.current = current
         self.thetas = np.array([current, current + np.pi / 2., current - np.pi / 2.])
         
     def set_coeffs(self, costs):
@@ -255,6 +293,7 @@ class InversionFirst(CostSectionFirst, MatrixInversionMixin):
         self.thetas = np.linspace(current - np.pi / 2., current + np.pi / 2., 3, endpoint=True)
         matrix = np.stack((np.sin(self.thetas), np.cos(self.thetas), np.ones_like(self.thetas)), axis=1)
         self.inverse_matrix = np.linalg.inv(matrix)
+        self.current = current
         
 class FitMixin:
     def __init__(self, points_coeff_ratio=4):
@@ -311,7 +350,7 @@ class FitSymmetric(CostSectionSymmetric):
         
     def set_thetas(self, current):
         self.thetas = np.linspace(current - np.pi, current + np.pi, 3 * self.ratio, endpoint=False)
-        self.minimum = current
+        self.theta_opt = current
         self.current = current
     
     def set_coeffs(self, costs):
@@ -335,4 +374,4 @@ class FitSymmetric(CostSectionSymmetric):
         res = sciopt.minimize(negative_likelihood, b0)
 
         self.coeffs = res.x[:3]
-        self.minimum = res.x[3]
+        self.theta_opt = res.x[3]

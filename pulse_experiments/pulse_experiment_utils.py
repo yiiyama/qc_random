@@ -1,3 +1,4 @@
+import re
 import numpy as np
 import matplotlib.pyplot as plt
 from scipy.optimize import minimize
@@ -19,6 +20,9 @@ def remove_barriers(circuit):
             iop += 1
 
     return circuit
+
+def get_instruction_by_name(schedule, pattern):
+    return next(inst for _, inst in schedule.instructions if inst.name is not None and re.match(pattern, inst.name))
 
 def submit_schedules(schedules, backend, shots=1024, meas_level=1, meas_return='avg', monitor=True):
     job = backend.run(schedules, meas_level=meas_level, meas_return=meas_return, shots=shots)
@@ -134,27 +138,6 @@ def projection(axis, schedule, backend, qubit, spectators=[], value_dict=None, e
         return full_schedule.exclude(exclude)
     else:
         return full_schedule
-
-class PaddedGaussianSquare(pulse.GaussianSquare):
-    def __init__(self, pulse_duration, amp, sigma, width, name=None):
-        residual = pulse_duration % 16
-        if residual == 0:
-            duration = pulse_duration
-        else:
-            duration = pulse_duration + 16 - residual
-            
-        pulse.GaussianSquare.__init__(self, duration, amp, sigma, width=width, name=name)
-        self._risefall_sigma_ratio = (pulse_duration - self.width) / (2.0 * self.sigma)
-        
-        self.pulse_duration = pulse_duration
-
-    def get_waveform(self):
-        waveform = pulse.GaussianSquare.get_waveform(self)
-        residual = self.pulse_duration % 16
-        if residual != 0:
-            waveform._samples = np.concatenate((np.zeros(16 - residual, dtype=waveform._samples.dtype), waveform._samples))
-
-        return waveform
     
 class DummyResult(object):
     def __init__(self, counts):

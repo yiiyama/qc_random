@@ -1,28 +1,35 @@
 from qiskit import QuantumCircuit, transpile
 
-def trotter_step_circuits(num_steps, single_step_circuit, two_step_circuit=None, initial_state=None, measure=True):
-    nsites = single_step_circuit.num_qubits
+def trotter_step_circuits(num_steps, circuit_elements, initial_state=None, measure=True):
+    nsites = circuit_elements[0].num_qubits
     
     circuits = []
     for nrep in range(1, num_steps + 1):
-        circuit = QuantumCircuit(nsites, nsites)
+        circuit = QuantumCircuit(nsites)
         if initial_state is None:
             circuit.x(range(0, nsites, 2))
         else:
             circuit.compose(initial_state, inplace=True)
 
-        if two_step_circuit is None:
+        if len(circuit_elements) == 1:
             for _ in range(nrep):
-                circuit.compose(single_step_circuit, inplace=True)
+                circuit.compose(circuit_elements[0], inplace=True)
         else:
-            for _ in range(nrep // 2):
-                circuit.compose(two_step_circuit, inplace=True)
+            block_size = len(circuit_elements)
+            while True:
+                for _ in range(nrep // block_size):
+                    circuit.compose(circuit_elements[block_size - 1], inplace=True)
+                
+                nrep = nrep % block_size
+                if nrep == 0:
+                    break
 
-            if nrep % 2 == 1:
-                circuit.compose(single_step_circuit, inplace=True)
+                block_size -= 1
+                while circuit_elements[block_size - 1] is None:
+                    block_size -= 1
 
         if measure:    
-            circuit.measure(circuit.qregs[0], circuit.cregs[0])
+            circuit.measure_all(circuit.qregs[0])
             
         circuits.append(circuit)
     

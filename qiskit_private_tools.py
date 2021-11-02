@@ -2,6 +2,7 @@ import collections
 from qiskit import IBMQ
 
 MY_PROVIDERS = collections.OrderedDict([('icepp', ('ibm-q-utokyo', 'internal', 'icepp')), ('ibmqr', ('ibm-q-research', 'tokyo-1', 'main'))])
+my_providers = dict()
 my_backends = dict()
 
 def backends_table(pulse_only=False):
@@ -12,6 +13,7 @@ def backends_table(pulse_only=False):
     
     for provname, provspec in MY_PROVIDERS.items():
         provider = IBMQ.get_provider(*provspec)
+        my_providers['/'.join(provspec)] = provider
         for backend in provider.backends():
             config = backend.configuration()
 
