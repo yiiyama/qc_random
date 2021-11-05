@@ -1,11 +1,9 @@
 import logging
 import numpy as np
-from qiskit import Aer, transpile
+from qiskit import transpile
 from qiskit.result.counts import Counts
 
-from cost_sections import InversionGeneral
-
-logger = logging.getLogger('four_qubit_schwinger.sequential_minimizer')
+logger = logging.getLogger('schwinger_rqd.sequential_minimizer')
 
 def combine_counts(new, base):
     data = dict(base)
@@ -22,26 +20,24 @@ class SequentialVCMinimizer:
         self,
         ansatz,
         cost_function,
+        section_generators,
         backend,
-        default_section=InversionGeneral,
         strategy='sequential',
         error_mitigation_filter=None,
+        transpile_fn=transpile,
         transpile_options={'optimization_level': 1},
         shots=8192,
         run_options={},
         seed=12345
     ):
-        self.ansatz = ansatz.copy()
-        
         self.cost_function = cost_function
         
-        self.cost_section_generators = [default_section for _ in range(len(self.ansatz.parameters))]
+        self.cost_section_generators = list(section_generators)
         
         self.strategy = strategy
 
-        self.backend = backend
+        self._backend = backend
         self.shots = shots
-        self.transpile_options = dict(transpile_options)
         self.run_options = dict(run_options)
         
         self.error_mitigation_filter = error_mitigation_filter
@@ -51,46 +47,76 @@ class SequentialVCMinimizer:
         self.callbacks_step = []
         self.callbacks_sweep = []
         
-        self.statevector_simulator = None
-        self.ideal_costs_step = None
-        self.shots_step = None
-        self.ideal_costs_sweep = None
-        self.shots_sweep = None
+        self._ansatz = ansatz.copy()
         
-    def minimize(
-        self,
+        ansatz = ansatz.remove_final_measurements(inplace=False)
+        if self._backend.name() != 'statevector_simulator':
+            ansatz.measure_all(inplace=True)
+
+        self._backend_ansatz = transpile_fn(ansatz, backend=self._backend, **transpile_options)
+            
+    @property
+    def ansatz(self):
+        return self._ansatz
+    
+    @property
+    def backend(self):
+        return self._backend
+        
+    def minimize(self,
         initial_param_val,
         max_sweeps=40,
         convergence_distance=1.e-3,
         convergence_cost=1.e-4
     ):
-        assert len(initial_param_val) == len(self.ansatz.parameters)
+        assert len(initial_param_val) == len(self._ansatz.parameters)
         
-        logger.info('Starting minimize() with initial parameters {}'.format(str(initial_param_val)))
+        logger.info('Starting minimize() with initial parameter values {}'.format(str(initial_param_val)))
 
-        # Returned values
-        param_val = np.array(initial_param_val)
-        total_shots = 0
-
-        # Values to be updated after each sweep
-        current_cost = 1.
         if self.strategy == 'largest-drop':
             self.no_scouting_direction = -1
-        
-        for isweep in range(max_sweeps):
-            logger.info('Sweep {} with strategy {} - current cost {} current shots {}'.format(isweep, self.strategy, current_cost, total_shots))
             
-            if self.strategy != 'largest_drop':
+        param_val = self._run_minimize(0, max_sweeps, initial_param_val, 1., 0, convergence_distance, convergence_cost)
+
+        return param_val
+    
+    def resume_minimization(self,
+        param_val,
+        current_sweep,
+        current_cost,
+        total_shots,
+        max_sweeps=40,
+        convergence_distance=1.e-3,
+        convergence_cost=1.e-4
+    ):
+        assert len(param_val) == len(self._ansatz.parameters)
+        
+        logger.info('Resuming minimization from parameter values {}'.format(str(param_val)))
+
+        if self.strategy == 'largest-drop':
+            self.no_scouting_direction = -1
+            
+        param_val = self._run_minimize(current_sweep, max_sweeps, param_val, current_cost, total_shots, convergence_distance, convergence_cost)
+
+        return param_val
+    
+    def _run_minimize(self, first_sweep, max_sweeps, current_param_val, current_cost, current_shots, convergence_distance, convergence_cost):
+        param_val = np.array(current_param_val)
+
+        for isweep in range(first_sweep, max_sweeps):
+            logger.info('Sweep {} with strategy {} - current cost {} current shots {}'.format(isweep, self.strategy, current_cost, current_shots))
+            
+            if self.strategy != 'largest-drop':
                 self.no_scouting_direction = -1
             
             if self.strategy == 'sequential':
-                sweep_res = self._minimize_sequential(isweep, param_val, current_cost, total_shots)
+                sweep_res = self._minimize_sequential(isweep, param_val, current_cost, current_shots)
 
             elif self.strategy == 'gradient-descent':
-                sweep_res = self._minimize_gradient_descent(isweep, param_val, current_cost, total_shots)
+                sweep_res = self._minimize_gradient_descent(isweep, param_val, current_cost, current_shots)
                 
             elif self.strategy == 'largest-drop':
-                sweep_res = self._minimize_largest_drop(isweep, param_val, current_cost, total_shots)
+                sweep_res = self._minimize_largest_drop(isweep, param_val, current_cost, current_shots)
                 
             sweep_param_val, sweep_cost, sweep_shots = sweep_res
                     
@@ -100,7 +126,7 @@ class SequentialVCMinimizer:
                 'sweep_param_val': sweep_param_val,
                 'current_cost': current_cost,
                 'sweep_cost': sweep_cost,
-                'current_shots': total_shots,
+                'current_shots': current_shots,
                 'sweep_shots': sweep_shots
             }
             for callback in self.callbacks_sweep:
@@ -119,16 +145,16 @@ class SequentialVCMinimizer:
                 break
                 
             param_val = sweep_param_val
-            total_shots += sweep_shots
+            current_shots += sweep_shots
             current_cost = sweep_cost
-
-        return param_val, total_shots
+            
+        return param_val
     
-    def _minimize_sequential(self, isweep, param_val, current_cost, total_shots):
+    def _minimize_sequential(self, isweep, param_val, current_cost, current_shots):
         sweep_param_val = param_val.copy()
         sweep_shots = 0
         
-        for iparam in range(len(self.ansatz.parameters)):
+        for iparam in range(len(self._ansatz.parameters)):
             logger.debug('sequential: Calculating cost section for parameter {}'.format(iparam))
             cost_section, costs, shots = self._calculate_cost_section(sweep_param_val, iparam)
 
@@ -141,7 +167,7 @@ class SequentialVCMinimizer:
                 'theta_opt': theta_opt,
                 'costs': costs,
                 'cost_section': cost_section,
-                'current_shots': total_shots + sweep_shots,
+                'current_shots': current_shots + sweep_shots,
                 'step_shots': shots
             }
             for callback in self.callbacks_step:
@@ -154,11 +180,11 @@ class SequentialVCMinimizer:
 
         return sweep_param_val, sweep_cost, sweep_shots
     
-    def _minimize_gradient_descent(self, isweep, param_val, current_cost, total_shots):
+    def _minimize_gradient_descent(self, isweep, param_val, current_cost, current_shots):
         sweep_shots = 0
         raw_data = dict()
         
-        param_ids = list(range(len(self.ansatz.parameters)))
+        param_ids = list(range(len(self._ansatz.parameters)))
         
         logger.info('gradient descent: Calculating cost sections for all parameters')
         cost_sections, costs, shots = self._calculate_cost_section(param_val, param_ids, raw_data=raw_data, reuse=True)
@@ -172,7 +198,7 @@ class SequentialVCMinimizer:
                     'theta_opt': cost_sections[iparam].minimum(),
                     'costs': costs[iparam],
                     'cost_section': cost_sections[iparam],
-                    'current_shots': total_shots + sweep_shots,
+                    'current_shots': current_shots + sweep_shots,
                     'step_shots': shots
                 }
                 for callback in self.callbacks_step:
@@ -191,7 +217,7 @@ class SequentialVCMinimizer:
         
         return sweep_param_val, sweep_cost, sweep_shots
     
-    def _minimize_largest_drop(self, isweep, param_val, current_cost, total_shots):
+    def _minimize_largest_drop(self, isweep, param_val, current_cost, current_shots):
         sweep_shots = 0
         
         ## Scouting run
@@ -200,7 +226,7 @@ class SequentialVCMinimizer:
 
         raw_data = dict()
         
-        param_ids = list(range(len(self.ansatz.parameters)))
+        param_ids = list(range(len(self._ansatz.parameters)))
         
         logger.info('largest drop: Calculating cost sections for all parameters')
 
@@ -240,7 +266,7 @@ class SequentialVCMinimizer:
             'theta_opt': theta_opt,
             'costs': costs,
             'cost_section': cost_section,
-            'current_shots': total_shots + sweep_shots,
+            'current_shots': current_shots + sweep_shots,
             'step_shots': shots
         }
         for callback in self.callbacks_step:
@@ -256,50 +282,17 @@ class SequentialVCMinimizer:
         
         return sweep_param_val, sweep_cost, sweep_shots
     
-    def ideal_cost_step(self, arg):
-        """Convenience function for tracking the ideal cost through callback
-        """
-        if self.statevector_simulator is None:
-            self.statevector_simulator = Aer.get_backend('statevector_simulator')
-
-        if self.ideal_costs_step is None:
-            self.ideal_costs_step = []
-            self.shots_step = []
-            
-        circuit = transpile(self._make_circuit(arg['param_val'], arg['iparam'], arg['theta_opt']), backend=self.statevector_simulator)
-        prob_dist = np.square(np.abs(self.statevector_simulator.run(circuit).result().data()['statevector']))
-        cost = self.cost_function(prob_dist)
-        
-        self.ideal_costs_step.append(cost)
-        self.shots_step.append(arg['current_shots'] + arg['step_shots'])
-        
-    def ideal_cost_sweep(self, arg):
-        """Convenience function for tracking the ideal cost through callback
-        """
-        if self.statevector_simulator is None:
-            self.statevector_simulator = Aer.get_backend('statevector_simulator')
-
-        if self.ideal_costs_sweep is None:
-            self.ideal_costs_sweep = []
-            self.shots_sweep = []
-            
-        circuit = transpile(self._make_circuit(arg['sweep_param_val']), backend=self.statevector_simulator)
-        prob_dist = np.square(np.abs(self.statevector_simulator.run(circuit).result().data()['statevector']))
-        cost = self.cost_function(prob_dist)
-        
-        self.ideal_costs_sweep.append(cost)
-        self.shots_sweep.append(arg['current_shots'] + arg['sweep_shots'])
-    
-    def _make_circuit(self, param_val, param_id=None, test_value=None):
+    def _make_circuit(self, param_val, param_id=None, test_value=None, template=None):
         if param_id is not None:
             param_val = np.copy(param_val)
             param_val[param_id] = test_value
             
-        param_dict = dict(zip(self.ansatz.parameters, param_val))
-        
-        circuit = self.ansatz.bind_parameters(param_dict)
-        if self.backend.name() != 'statevector_simulator':
-            circuit.measure_all(inplace=True)
+        if template is None:
+            template = self._backend_ansatz
+
+        param_dict = dict(zip(template.parameters, param_val))
+
+        circuit = template.bind_parameters(param_dict)
             
         return circuit
     
@@ -308,17 +301,14 @@ class SequentialVCMinimizer:
         Args:
             circuits (list): List of circuits or dicts. Dict elements represent raw data from previous experiments.
         """
-        if self.backend.configuration().simulator:
-            circuits_to_run = transpile(circuits, backend=self.backend, **self.transpile_options)
-        else:
-            circuits_to_run = transpile_with_dynamical_decoupling(circuits, backend=self.backend, **self.transpile_options)
-            
-        if self.backend.name() == 'statevector_simulator':
+        circuits_to_run = list(circuits)
+        
+        if self._backend.name() == 'statevector_simulator':
             run_options = self.run_options
             shots_used = self.shots * len(circuits_to_run) # dummy
         else:
             run_options = dict(self.run_options)
-            max_shots = self.backend.configuration().max_shots
+            max_shots = self._backend.configuration().max_shots
             if max_shots < self.shots:
                 run_options['shots'] = max_shots
                 circuits_to_run *= (self.shots // max_shots)
@@ -329,7 +319,11 @@ class SequentialVCMinimizer:
             
         logger.info('run circuits: Running {} experiments, {} shots each'.format(len(circuits_to_run), run_options['shots']))
         
-        max_experiments = backend.configuration().max_experiments
+        try:
+            max_experiments = self._backend.configuration().max_experiments
+        except AttributeError:
+            max_experiments = len(circuits_to_run)
+            
         circuit_blocks = []
         for ic in range(0, len(circuits_to_run), max_experiments):
             circuit_blocks.append(circuits_to_run[ic:ic + max_experiments])
@@ -337,9 +331,9 @@ class SequentialVCMinimizer:
         results = list(Counts(dict()) for _ in range(len(circuits)))
         ires = 0
         for circuit_block in circuit_blocks:
-            run_result = self.backend.run(circuit_block, **run_options).result()
+            run_result = self._backend.run(circuit_block, **run_options).result()
 
-            if self.backend.name() == 'statevector_simulator':
+            if self._backend.name() == 'statevector_simulator':
                 results += [res.data.statevector for res in run_result.results]
             else:
                 counts_list = run_result.get_counts()
@@ -352,7 +346,7 @@ class SequentialVCMinimizer:
     def _compute_probabilities(self, results):
         prob_dists = []
         
-        if self.backend.name() == 'statevector_simulator':
+        if self._backend.name() == 'statevector_simulator':
             for statevector in results:
                 exact = np.square(np.abs(statevector))
                 if self.shots <= 0:
@@ -372,7 +366,7 @@ class SequentialVCMinimizer:
 
             for counts in corrected_counts:
                 total = sum(counts.values())
-                prob_dist = np.zeros(2 ** self.ansatz.num_qubits, dtype='f8')
+                prob_dist = np.zeros(2 ** self._ansatz.num_qubits, dtype='f8')
                 for idx, value in counts.int_outcomes().items():
                     prob_dist[idx] = value / total
 
@@ -420,6 +414,8 @@ class SequentialVCMinimizer:
             reuse (bool): If True, raw_data is used instead of performing new measurements, if available.
                 If False, new measurements are performed and raw_data is updated (applicable only to counts)
         """
+        logger.info('calculate cost section over parameters {}'.format(str(param_ids)))
+        
         if isinstance(param_ids, int):
             list_input = False
             param_ids = [param_ids]
@@ -470,7 +466,7 @@ class SequentialVCMinimizer:
                 for theta, result in zip(cost_section.thetas, results):
                     key = tuple(np.concatenate((param_val[:param_id], [theta], param_val[param_id + 1:])))
 
-                    if self.backend.name() == 'statevector_simulator':
+                    if self._backend.name() == 'statevector_simulator':
                         raw_data[key] = result
                     else:
                         try:
@@ -510,3 +506,40 @@ class SectionGenSwitcher:
             minimizer.cost_section_generators[iparam] = self.generator
 
         self.switched = True
+
+from qiskit import Aer
+
+class IdealCost:
+    def __init__(self, ansatz):
+        self.costs_step = []
+        self.shots_step = []
+        self.costs_sweep = []
+        self.shots_sweep = []
+        
+        self._ansatz = transpile(ansatz, backend=Aer.get_backend('statevector_simulator'))
+        
+    def callback_step(self, minimizer, arg):
+        simulator = Aer.get_backend('statevector_simulator')
+        
+        param_val = np.copy(arg['param_val'])
+        param_val[arg['iparam']] = arg['theta_opt']
+        param_dict = dict(zip(self._ansatz.parameters, param_val))
+        circuit = self._ansatz.bind_parameters(param_dict)
+
+        prob_dist = np.square(np.abs(simulator.run(circuit).result().data()['statevector']))
+        cost = minimizer.cost_function(prob_dist)
+        
+        self.costs_step.append(cost)
+        self.shots_step.append(arg['current_shots'] + arg['step_shots'])
+        
+    def callback_sweep(self, minimizer, arg):
+        simulator = Aer.get_backend('statevector_simulator')
+        
+        param_dict = dict(zip(self._ansatz.parameters, arg['sweep_param_val']))
+        circuit = self._ansatz.bind_parameters(param_dict)
+
+        prob_dist = np.square(np.abs(simulator.run(circuit).result().data()['statevector']))
+        cost = minimizer.cost_function(prob_dist)
+        
+        self.costs_sweep.append(cost)
+        self.shots_sweep.append(arg['current_shots'] + arg['sweep_shots'])

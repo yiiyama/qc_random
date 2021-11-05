@@ -1,49 +1,53 @@
 import os
 import sys
+import re
 import numpy as np
 import logging
-from qiskit import QuantumCircuit, QuantumRegister, transpile
+from qiskit import QuantumCircuit, QuantumRegister, transpile, IBMQ, Aer
+from qiskit.converters import circuit_to_dag
 from qiskit.ignis.mitigation.measurement import complete_meas_cal, MeasurementFilter
 from qiskit.result.counts import Counts
+from qiskit.providers.ibmq import IBMQAccountError
 
 logging.basicConfig(level=logging.WARNING, format='%(asctime)s: %(message)s')
-logging.getLogger('four_qubit_schwinger')
-logger = logging.getLogger('four_qubit_schwinger.main')
+logging.getLogger('schwinger_rqd')
+logger = logging.getLogger('schwinger_rqd.main')
 
-sys.path.append(os.path.dirname(__file__) + '/..')
+## ignore
+sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 
-## include ../ ##
+## include ../
 from rttgen import CNOTBasedRtt, PulseEfficientCR
 
-## include ../ ##
+## include ../
 from cx_decomposition import cx_circuit
 
-## include ../ ##
+## include ../
 from model_circuits import single_step, two_steps
 
-## include ../ ##
+## include ../
 from trotter import trotter_step_circuits
 
-## include ../ ##
+## include ../
 from transpile_with_dd import transpile_with_dynamical_decoupling
 
-## include ../ ##
+## include ../
 from pnp_ansatze import make_pnp_ansatz
 
-## include ../ ##
+## include ../
 from cost_functions import global_cost_function, local_cost_function
 
-## include ../ ##
+## include ../
 from cost_sections import FitSecond, FitFirst, FitGeneral, FitSymmetric
 
-## include ../ ##
-from sequential_minimizer import SequentialVCMinimizer, SectionGenSwitcher
+## include ../
+from sequential_minimizer import SequentialVCMinimizer, SectionGenSwitcher, IdealCost
 
 #####################################################################################################
 ### FORWARD CIRCUIT COMPONENTS ######################################################################
 #####################################################################################################
 
-def make_step_circuits(num_sites, aJ, am, omegadt, backend, physical_qubits):
+def make_step_circuits(num_sites, aJ, am, omegadt, backend, physical_qubits=None):
     qubit_pairs = list(zip(range(0, num_sites - 1), range(1, num_sites)))
   
     if backend.configuration().simulator:
@@ -117,71 +121,69 @@ def run_forward_circuits(
     return counts_list
 
 #####################################################################################################
-### RQD STEP ########################################################################################
+### FISC STEP ########################################################################################
 #####################################################################################################
 
-def rqd_step(
-    num_tsteps,
-    forward_circuits,
+def run_fisc(
+    compiler_circuit,
     backend,
     physical_qubits,
     max_sweeps,
-    minimizer_shots,
-    forward_shots,
+    shots,
     error_mitigation_filter,
-    optimal_params):
-    
-    num_sites = forward_circuits[0].num_qubits
-    approximator = make_pnp_ansatz(
-        num_qubits=num_sites,
-        num_layers=num_sites // 2,
-        initial_x_positions=[1, 2],
-        structure=[(1, 2), (0, 1), (2, 3)],
-        first_layer_structure=[(0, 1), (2, 3)])
-    
-    if optimal_params is None:
-        initial_state = None
+    ideal_cost=None,
+    publish_sweep_result=None,
+    resume_from=None):
+
+    section_generators = [FitGeneral] * len(compiler_circuit.parameters)
+    if compiler_circuit.num_qubits == 2:
+        section_generators[0] = FitSecond
+        section_generators[1] = FitFirst
+    elif compiler_circuit.num_qubits == 4:
+        section_generators[0] = FitSecond
+        section_generators[1] = FitFirst
+        section_generators[2] = FitSecond
+        section_generators[3] = FitFirst
+        section_generators[5] = FitFirst
+        
+    if backend.configuration().simulator:
+        transpile_fn = transpile
     else:
-        initial_state = approximator.bind_parameters(dict(zip(approximator.parameters, optimal_params)))
-
-    target_circuits = trotter_step_circuits(num_tsteps, forward_circuits, initial_state=initial_state, measure=False)
-
-    forward_counts = run_forward_circuits(
-        target_circuits,
-        backend,
-        initial_layout=physical_qubits,
-        shots=forward_shots,
-        error_mitigation_filter=error_mitigation_filter)
-
-    compiler_circuit = target_circuits[-1].compose(approximator.inverse(), inplace=False)
+        transpile_fn = transpile_with_dynamical_decoupling    
 
     minimizer = SequentialVCMinimizer(
         compiler_circuit,
         local_cost_function,
+        section_generators,
         backend,
         strategy='largest-drop',
         error_mitigation_filter=error_mitigation_filter,
-        shots=minimizer_shots,
-        default_section=FitGeneral)
+        transpile_fn=transpile_fn,
+        transpile_options={'initial_layout': physical_qubits, 'optimization_level': 1},
+        shots=shots)
     
-    minimizer.cost_section_generators[0] = FitSecond
-    minimizer.cost_section_generators[1] = FitFirst
-    minimizer.cost_section_generators[2] = FitSecond
-    minimizer.cost_section_generators[3] = FitFirst
-    minimizer.cost_section_generators[5] = FitFirst
-    
-    minimizer.callbacks_sweep.append(SequentialVCMinimizer.ideal_cost_sweep)
+    if ideal_cost is not None:
+        minimizer.callbacks_sweep.append(ideal_cost.callback_sweep)
+        
+    if publish_sweep_result is not None:
+        minimizer.callbacks_sweep.append(publish_sweep_result)
 
-    switcher = SectionGenSwitcher(FitSymmetric, [4, 6, 7, 8, 9], 0.015)
-    minimizer.callbacks_sweep.append(switcher.callback_sweep)
+    if compiler_circuit.num_qubits == 4:
+        switcher = SectionGenSwitcher(FitSymmetric, [4, 6, 7, 8, 9], 0.015)
+        minimizer.callbacks_sweep.append(switcher.callback_sweep)
 
-    initial_params = np.ones(len(approximator.parameters)) * np.pi / 4.
-    param_val, total_shots = minimizer.minimize(initial_params, max_sweeps=max_sweeps)
+    if resume_from is None or 'current_sweep' not in resume_from:
+        initial_params = np.ones(len(compiler_circuit.parameters)) * np.pi / 4.
+        param_val = minimizer.minimize(initial_params, max_sweeps=max_sweeps)
+    else:
+        param_val = minimizer.resume_minimization(
+            resume_from['param_val'],
+            resume_from['current_sweep'],
+            resume_from['current_cost'],
+            resume_from['total_shots'],
+            max_sweeps=max_sweeps)
 
-    shots_values = np.array(minimizer.shots_sweep)
-    cost_values = np.array(minimizer.ideal_costs_sweep)
-    
-    return forward_counts, param_val, total_shots, shots_values, cost_values
+    return param_val
 
 #####################################################################################################
 ### MAIN ############################################################################################
@@ -195,51 +197,114 @@ def main(backend, user_messenger, **kwargs):
         user_messenger: Used to communicate with the program consumer.
         kwargs: User inputs.
     """
-    
+
     num_sites = kwargs['num_sites']
     aJ = kwargs['aJ']
     am = kwargs['am']
     omegadt = kwargs['omegadt']
     num_tsteps = kwargs['num_tsteps']
     tsteps_per_rqd = kwargs['tsteps_per_rqd']
+    api_token = kwargs.get('api_token', None) # required as a Runtime program but not for local tests
     physical_qubits = kwargs.get('physical_qubits', None)
     error_matrix = kwargs.get('error_matrix', None)
     max_sweeps = kwargs.get('max_sweeps', 100)
     minimizer_shots = kwargs.get('minimizer_shots', 4096)
     forward_shots = kwargs.get('foward_shots', 2 * 8192)
+    resume_from = kwargs.get('resume_from', None)
     
     if error_matrix is not None:
         _, state_labels = complete_meas_cal(qubit_list=list(range(num_sites)), qr=QuantumRegister(num_sites), circlabel='mcal')
         error_mitigation_filter = MeasurementFilter(error_matrix, state_labels)
     else:
         error_mitigation_filter = None
+
+    if api_token is None:
+        ibmq_backend = backend
+    else:
+        try:
+            ibmq_provider = IBMQ.enable_account(api_token, hub='ibm-q-utokyo', group='internal', project='icepp')
+        except IBMQAccountError:
+            ibmq_provider = IBMQ.get_provider(hub='ibm-q-utokyo', group='internal', project='icepp')
+
+        ibmq_backend = ibmq_provider.get_backend(backend.name())
         
-    forward_circuits = make_step_circuits(num_sites, aJ, am, omegadt, backend, physical_qubits)
+    forward_step_circuits = make_step_circuits(num_sites, aJ, am, omegadt, ibmq_backend, physical_qubits)
+    if not ibmq_backend.configuration().simulator:
+        sim_forward_step_circuits = make_step_circuits(num_sites, aJ, am, omegadt, Aer.get_backend('statevector_simulator'))
     
-    forward_counts_list = []
+    if num_sites == 2:
+        approximator = make_pnp_ansatz(
+            num_qubits=num_sites,
+            num_layers=num_sites // 2,
+            initial_x_positions=[0])
+    elif num_sites == 4:
+        approximator = make_pnp_ansatz(
+            num_qubits=num_sites,
+            num_layers=num_sites // 2,
+            initial_x_positions=[1, 2],
+            structure=[(1, 2), (0, 1), (2, 3)],
+            first_layer_structure=[(0, 1), (2, 3)])
+    
+    full_forward_counts = []
     optimal_params_list = []
 
-    optimal_params = None
+    if resume_from is None:
+        first_rqd_step = 0
+    else:
+        first_rqd_step = resume_from['rqd_step']
+        if first_rqd_step != 0:
+            optimal_params = resume_from['optimal_params']
 
-    for it in range(num_tsteps // tsteps_per_rqd):
+    for it in range(first_rqd_step, num_tsteps // tsteps_per_rqd):
         logger.info('Starting RQD step {}'.format(it))
         
-        forward_counts, optimal_params, total_shots, shots_values, cost_values = rqd_step(
-            tsteps_per_rqd,
-            forward_circuits,
+        if it == 0:
+            initial_state = None
+        else:
+            params_dict = dict(zip(approximator.parameters, optimal_params))
+            initial_state = approximator.bind_parameters(params_dict)
+
+        target_circuits = trotter_step_circuits(tsteps_per_rqd, forward_step_circuits, initial_state=initial_state, measure=False)
+        
+        if resume_from is None or 'current_sweep' not in resume_from:
+            forward_counts = run_forward_circuits(target_circuits, backend, initial_layout=physical_qubits, shots=forward_shots, error_mitigation_filter=error_mitigation_filter)
+            user_messenger.publish({'rqd_step': it, 'forward_counts': forward_counts})
+            full_forward_counts += forward_counts
+        
+        compiler_circuit = target_circuits[-1].compose(approximator.inverse(), inplace=False)
+
+        if ibmq_backend.configuration().simulator:
+            ideal_cost = IdealCost(compiler_circuit)
+        else:
+            targets = trotter_step_circuits(tsteps_per_rqd, sim_forward_step_circuits, initial_state=initial_state, measure=False)
+            ideal_cost = IdealCost(targets[-1].compose(approximator.inverse(), inplace=False))
+            
+        def callback_publish_sweep_result(minimizer, arg):
+            sweep_result = {
+                'rqd_step': it,
+                'isweep': arg['isweep'],
+                'param_val': arg['sweep_param_val'],
+                'cost': arg['sweep_cost'], 
+                'total_shots': arg['current_shots'] + arg['sweep_shots'],
+                'shots_values': np.array(ideal_cost.shots_sweep),
+                'cost_values': np.array(ideal_cost.costs_sweep)
+            }
+            user_messenger.publish(sweep_result)
+        
+        optimal_params = run_fisc(
+            compiler_circuit,
             backend,
             physical_qubits,
             max_sweeps,
             minimizer_shots, 
-            forward_shots,
             error_mitigation_filter,
-            optimal_params)
+            ideal_cost,
+            callback_publish_sweep_result,
+            resume_from
+        )
+        user_messenger.publish({'rqd_step': it, 'optimal_params': optimal_params})
+        optimal_params_list.append(optimal_params)
         
         logger.info('Completed RQD step {}'.format(it))
 
-        user_messenger.publish({"rqd_step": it, "total_shots": total_shots, "shots_values": shots_values, "cost_values": cost_values})
-
-        forward_counts_list.append(forward_counts)
-        optimal_params_list.append(optimal_params)
-
-    return forward_counts_list, optimal_params_list
+    return full_forward_counts, optimal_params_list

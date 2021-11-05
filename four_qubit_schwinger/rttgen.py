@@ -24,12 +24,16 @@ def find_native_cr_direction(backend, qubits):
 
 class BaseRtt(object):
     def __init__(self, backend, qubits):
-        if backend.configuration().simulator:
-            native_qubits = qubits
-        else:
-            native_qubits = find_native_cr_direction(backend, qubits)
+#         if backend.configuration().simulator:
+#             native_qubits = qubits
+#         else:
+#             native_qubits = find_native_cr_direction(backend, qubits)
         
-        self.native_direction = (native_qubits[0] == qubits[0])
+#         self.native_direction = (native_qubits[0] == qubits[0])
+
+        # Runtime backends don't expose defaults (and therefore the cx schedule)
+        # We have to pass the qubits in the native order in the constructor
+        self.native_direction = True
         
     def ryy_circuit(self, phi_value):
         rxx_circuit = self.rxx_circuit(phi_value)
